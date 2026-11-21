@@ -371,11 +371,19 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'valid,
             };
+            if abl == 21 {
+                *sink += ts as u64;
+                return;
+            }
             let tl = ln(4);
             let tw = (at(4) as *const u32).read_unaligned();
             let purchase = tl == 8 && (at(4) as *const u64).read_unaligned() == PURCHASE;
             if !(purchase | ((tl == 4) & ((tw == VIEW) | (tw == CART)))) {
                 break 'valid;
+            }
+            if abl == 22 {
+                *sink += ts as u64 + purchase as u64;
+                return;
             }
             let mut pc = 0u32;
             if purchase {
@@ -674,6 +682,40 @@ fn redirect_partition(ms: &mut MState, a: &[AState], rd: &[Scatter16<Rd>], u: us
     }
 }
 
+/// Every event of partition `j`, in a fixed order: own rows not tombstoned
+/// or redirected away, then rows redirected here.
+#[inline(always)]
+fn each_ev(srcs: &[AState], ms: &[MState], j: usize, own: &impl Fn(u64) -> bool, mut f: impl FnMut(&PEv)) {
+    for s in srcs {
+        for e in s.pe.records(j) {
+            if e.ts != TOMB && own(e.person) {
+                f(e);
+            }
+        }
+    }
+    for m in ms {
+        for e in m.mv.records(j) {
+            f(e);
+        }
+    }
+}
+
+#[inline(always)]
+fn each_ck(srcs: &[AState], ms: &[MState], j: usize, own: &impl Fn(u64) -> bool, mut f: impl FnMut(&PCk)) {
+    for s in srcs {
+        for c in &s.pc.parts[j] {
+            if own(c.person) {
+                f(c);
+            }
+        }
+    }
+    for m in ms {
+        for c in &m.mvc.parts[j] {
+            f(c);
+        }
+    }
+}
+
 #[inline(never)]
 fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scatter16<Rd>], j: usize, ctx: &Ctx) {
     let interned = any_interned();
@@ -681,42 +723,12 @@ fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scat
     let any_rd = load_redirects(rd, j, rmap, roots);
     let rmap = &*rmap;
     let own = |k: u64| !any_rd || rmap.get(k).is_none();
-    // Every event of this partition, in a fixed order: own rows not
-    // redirected away, then rows redirected here.
-    let each_ev = |f: &mut dyn FnMut(&PEv)| {
-        for s in srcs {
-            for e in s.pe.records(j) {
-                if e.ts != TOMB && own(e.person) {
-                    f(e);
-                }
-            }
-        }
-        for m in ms {
-            for e in m.mv.records(j) {
-                f(e);
-            }
-        }
-    };
-    let each_ck = |f: &mut dyn FnMut(&PCk)| {
-        for s in srcs {
-            for c in &s.pc.parts[j] {
-                if own(c.person) {
-                    f(c);
-                }
-            }
-        }
-        for m in ms {
-            for c in &m.mvc.parts[j] {
-                f(c);
-            }
-        }
-    };
     let n: usize = srcs.iter().map(|s| s.pe.len(j)).sum::<usize>() + ms.iter().map(|m| m.mv.len(j)).sum::<usize>();
     pmap.reset(n / 8 + 16);
     persons.clear();
     local.clear();
     cursor.clear();
-    each_ev(&mut |e| {
+    each_ev(srcs, ms, j, &own, |e| {
         let (idx, inserted) = pmap.get_or_insert(e.person, persons.len() as u32);
         if inserted {
             persons.push(e.person);
@@ -731,7 +743,7 @@ fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scat
     evs.clear();
     evs.resize(ev_start[np] as usize, PEv::default());
     let mut k = 0usize;
-    each_ev(&mut |e| {
+    each_ev(srcs, ms, j, &own, |e| {
         let idx = local[k] as usize;
         k += 1;
         let pos = cursor[idx] as usize;
@@ -740,7 +752,7 @@ fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scat
     });
     local.clear();
     cursor.iter_mut().for_each(|c| *c = 0);
-    each_ck(&mut |c| {
+    each_ck(srcs, ms, j, &own, |c| {
         let idx = pmap.get(c.person).unwrap_or(NONE);
         if idx != NONE {
             cursor[idx as usize] += 1;
@@ -752,7 +764,7 @@ fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scat
     cks.clear();
     cks.resize(ck_start[np] as usize, PCk::default());
     let mut k = 0usize;
-    each_ck(&mut |c| {
+    each_ck(srcs, ms, j, &own, |c| {
         let idx = local[k];
         k += 1;
         if idx != NONE {
