@@ -163,6 +163,10 @@ impl IndexTable {
     }
 }
 
+/// Experiment switch for `LocalMap`: clear only the slots used since the
+/// last reset, in a buffer that only grows (default off).
+pub static LMAP_TOUCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Small growable map from non-zero u64 keys to dense u32 indexes, reset per
 /// partition and sized to stay in cache.
 pub struct LocalMap {
@@ -170,21 +174,39 @@ pub struct LocalMap {
     vals: Vec<u32>,
     mask: usize,
     len: usize,
+    touched: Vec<u32>,
+    track: bool,
 }
 
 impl LocalMap {
     pub fn new() -> Self {
-        LocalMap { keys: Vec::new(), vals: Vec::new(), mask: 0, len: 0 }
+        LocalMap { keys: Vec::new(), vals: Vec::new(), mask: 0, len: 0, touched: Vec::new(), track: false }
     }
 
     pub fn reset(&mut self, expect: usize) {
         let cap = (expect * 2).max(64).next_power_of_two();
-        if self.keys.len() != cap {
+        let track = LMAP_TOUCHED.load(std::sync::atomic::Ordering::Relaxed);
+        if track {
+            // Every non-empty slot is in `touched` (recorded once, on insertion).
+            if self.track {
+                for &i in &self.touched {
+                    unsafe { *self.keys.get_unchecked_mut(i as usize) = 0 };
+                }
+            } else {
+                self.keys.iter_mut().for_each(|k| *k = 0);
+            }
+            self.touched.clear();
+            if self.keys.len() < cap {
+                self.keys = vec![0; cap];
+                self.vals = vec![0; cap];
+            }
+        } else if self.keys.len() != cap {
             self.keys = vec![0; cap];
             self.vals = vec![0; cap];
         } else {
             self.keys.iter_mut().for_each(|k| *k = 0);
         }
+        self.track = track;
         self.mask = cap - 1;
         self.len = 0;
     }
@@ -192,7 +214,7 @@ impl LocalMap {
     /// The index for `k`, inserting `next` if absent (second value: inserted).
     #[inline(always)]
     pub fn get_or_insert(&mut self, k: u64, next: u32) -> (u32, bool) {
-        if (self.len + 1) * 2 > self.keys.len() {
+        if (self.len + 1) * 2 > self.mask + 1 {
             self.grow();
         }
         let mut i = mix(k) as usize & self.mask;
@@ -205,6 +227,9 @@ impl LocalMap {
                 unsafe {
                     *self.keys.get_unchecked_mut(i) = k;
                     *self.vals.get_unchecked_mut(i) = next;
+                }
+                if self.track {
+                    self.touched.push(i as u32);
                 }
                 self.len += 1;
                 return (next, true);
@@ -229,19 +254,23 @@ impl LocalMap {
     }
 
     fn grow(&mut self) {
-        let (old_keys, old_vals) = (std::mem::take(&mut self.keys), std::mem::take(&mut self.vals));
-        let cap = old_keys.len() * 2;
+        let used = self.mask + 1;
+        let entries: Vec<(u64, u32)> =
+            (0..used).filter(|&i| self.keys[i] != 0).map(|i| (self.keys[i], self.vals[i])).collect();
+        let cap = used * 2;
         self.keys = vec![0; cap];
         self.vals = vec![0; cap];
         self.mask = cap - 1;
-        for (k, v) in old_keys.into_iter().zip(old_vals) {
-            if k != 0 {
-                let mut i = mix(k) as usize & self.mask;
-                while self.keys[i] != 0 {
-                    i = (i + 1) & self.mask;
-                }
-                self.keys[i] = k;
-                self.vals[i] = v;
+        self.touched.clear();
+        for (k, v) in entries {
+            let mut i = mix(k) as usize & self.mask;
+            while self.keys[i] != 0 {
+                i = (i + 1) & self.mask;
+            }
+            self.keys[i] = k;
+            self.vals[i] = v;
+            if self.track {
+                self.touched.push(i as u32);
             }
         }
     }

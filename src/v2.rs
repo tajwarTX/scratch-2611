@@ -276,8 +276,9 @@ impl Links {
     }
 }
 
-fn parse_links(file: &[u8], start: usize, end: usize, links: &Links, sc: &mut Scanner) {
-    tok::scan_file::<2>(sc, file, start, end, |p, s, e| unsafe {
+#[inline(always)]
+fn parse_links<const W: bool>(file: &[u8], start: usize, end: usize, links: &Links, sc: &mut Scanner) {
+    tok::scan_file_w::<2, W>(sc, file, start, end, |p, s, e| unsafe {
         let (na, nb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
         if na == 0 || nb == 0 {
             return;
@@ -400,13 +401,13 @@ unsafe fn convert_event(ctx: &Ctx, p: *const u8, s: &[u32; 7], e: &[u32; 7]) -> 
     Some(EvOut { id, ingest, ev })
 }
 
-#[inline(never)]
-fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState) {
+#[inline(always)]
+fn parse_events<const W: bool>(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState) {
     let (p1, p2, ib) = (ctx.p1_bits, ctx.p2_bits, ctx.idx_bits);
     let loc_hi = st.tid << (p2 + ib);
     let idx_max = (1usize << ib) - 2;
     let AState { pe, dd, sc, bad, .. } = st;
-    tok::scan_file::<7>(sc, file, start, end, |p, s, e| unsafe {
+    tok::scan_file_w::<7, W>(sc, file, start, end, |p, s, e| unsafe {
         let Some(o) = convert_event(ctx, p, s, e) else { return };
         let ingest = o.ingest.unwrap_or_else(|| {
             *bad = true;
@@ -423,6 +424,27 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
         }
         dd.push(part(o.id, p1), Dd { id: o.id, ingest, loc });
     });
+}
+
+/// One parse job (0 links, 1 events, 2 clicks) with the AVX2 tokenizer.
+#[inline(never)]
+fn parse_job(kind: u8, data: &[u8], s: usize, e: usize, ctx: &Ctx, links: &Links, st: &mut AState) {
+    match kind {
+        0 => parse_links::<false>(data, s, e, links, &mut st.sc),
+        1 => parse_events::<false>(data, s, e, ctx, st),
+        _ => parse_clicks::<false>(data, s, e, ctx, st),
+    }
+}
+
+/// `parse_job` with AVX-512BW tokenizer masks (only call on such a CPU).
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline(never)]
+unsafe fn parse_job_512(kind: u8, data: &[u8], s: usize, e: usize, ctx: &Ctx, links: &Links, st: &mut AState) {
+    match kind {
+        0 => parse_links::<true>(data, s, e, links, &mut st.sc),
+        1 => parse_events::<true>(data, s, e, ctx, st),
+        _ => parse_clicks::<true>(data, s, e, ctx, st),
+    }
 }
 
 /// CBENCH=1: single-thread cost of `convert_event` alone, over the largest
@@ -478,11 +500,11 @@ fn conv_bench(ctx: &Ctx, maps: &[Option<Mmap>]) {
     }
 }
 
-#[inline(never)]
-fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState) {
+#[inline(always)]
+fn parse_clicks<const W: bool>(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState) {
     let (lo, hi, base, p2) = (ctx.ws - REACH, ctx.we, ctx.base, ctx.p2_bits);
     let AState { pc, sc, .. } = st;
-    tok::scan_file::<4>(sc, file, start, end, |p, s, e| unsafe {
+    tok::scan_file_w::<4, W>(sc, file, start, end, |p, s, e| unsafe {
         let at = |i: usize| p.add(s[i] as usize);
         let ln = |i: usize| (e[i] - s[i]) as usize;
         if ln(0) == 0 || ln(1) == 0 {
@@ -1128,6 +1150,7 @@ fn bits_for(items: usize, per_part: usize, max_bits: u32) -> u32 {
 /// (nothing has been written then).
 pub fn run() -> bool {
     let t0 = Instant::now();
+    crate::table::LMAP_TOUCHED.store(env("LMAP", "") == "touched", Ordering::Relaxed);
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let out_dir = PathBuf::from(env("OUTPUT_DIR", "/output"));
     let threads: usize = std::env::var("NCPU")
@@ -1252,6 +1275,11 @@ pub fn run() -> bool {
         })
         .collect();
     let readio = env("READIO", "0") == "1";
+    // AVX-512BW tokenizer masks: opt-in (TOK512=1) until measured on the scorer.
+    let use512 = env("TOK512", "0") == "1" && std::is_x86_feature_detected!("avx512bw");
+    if env("TOK512", "0") == "1" {
+        eprintln!("TOK512 requested, avx512bw={}", std::is_x86_feature_detected!("avx512bw"));
+    }
     let open = |dir: &str| -> Vec<std::fs::File> {
         list_csv(&data.join(dir)).iter().map(|p| std::fs::File::open(p).expect("open")).collect()
     };
@@ -1259,10 +1287,12 @@ pub fn run() -> bool {
     let maps = [&link_maps, &event_maps, &click_maps];
     run_jobs(&mut a_states, jobs.len(), |st, j| {
         let (kind, fi, s, e) = jobs[j];
-        let mut run = |st: &mut AState, data: &[u8], s: usize, e: usize| match kind {
-            0 => parse_links(data, s, e, &links, &mut st.sc),
-            1 => parse_events(data, s, e, &ctx, st),
-            _ => parse_clicks(data, s, e, &ctx, st),
+        let mut run = |st: &mut AState, data: &[u8], s: usize, e: usize| {
+            if use512 {
+                unsafe { parse_job_512(kind, data, s, e, &ctx, &links, st) }
+            } else {
+                parse_job(kind, data, s, e, &ctx, &links, st)
+            }
         };
         if !readio {
             run(st, maps[kind as usize][fi].as_ref().unwrap(), s, e);
@@ -1430,6 +1460,11 @@ pub fn run() -> bool {
 
     write_outputs(&out_dir, &ctx, &c_states);
     log!(t0, "done");
+    if env("STATS", "0") == "1" {
+        let sm = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        let thp = sm.lines().find(|l| l.starts_with("AnonHugePages")).unwrap_or("").split_whitespace().nth(1).unwrap_or("0").to_string();
+        eprintln!("STATS anon_huge_kb={}", thp);
+    }
     {
         // The process exits right after: freeing these piecemeal only costs time.
         std::mem::forget((a_states, m_states, c_states, rd, links, bases));

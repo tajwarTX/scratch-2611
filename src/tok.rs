@@ -44,10 +44,21 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     (mm(sa) | (mm(sb) << 32), mm(eq(a, b'"')) | (mm(eq(b, b'"')) << 32), mm(na) | (mm(nb) << 32))
 }
 
+/// `masks` with AVX-512BW: one load, three compares straight into mask registers.
+#[target_feature(enable = "avx512f,avx512bw")]
+#[inline]
+unsafe fn masks512(p: *const u8) -> (u64, u64, u64) {
+    let v = _mm512_loadu_si512(p as *const _);
+    let n = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+    let c = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8));
+    let q = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8));
+    (c | n, q, n)
+}
+
 /// `masks` of the block at `b`, cleared from `lim` on.
 #[inline(always)]
-unsafe fn block(data: *const u8, b: usize, lim: usize) -> (u64, u64, u64) {
-    let (mut s, mut q, mut n) = masks(data.add(b));
+unsafe fn block<const W: bool>(data: *const u8, b: usize, lim: usize) -> (u64, u64, u64) {
+    let (mut s, mut q, mut n) = if W { masks512(data.add(b)) } else { masks(data.add(b)) };
     if lim - b < 64 {
         let keep = (1u64 << (lim - b)) - 1;
         s &= keep;
@@ -108,7 +119,7 @@ impl Scanner {
     /// `data`. Bytes from `s - PAD` to `e + PAD` must be readable, and a line
     /// that runs to `e` without `\n` must have one at `e` (callers pad).
     #[inline(always)]
-    pub unsafe fn scan<const N: usize>(&mut self, data: *const u8, s: usize, e: usize, mut each: impl FnMut(&[u32; N], &[u32; N])) {
+    pub unsafe fn scan<const N: usize, const W: bool>(&mut self, data: *const u8, s: usize, e: usize, mut each: impl FnMut(&[u32; N], &[u32; N])) {
         let stp = self.st.as_mut_ptr();
         let enp = self.en.as_mut_ptr();
         let nlp = self.nl.as_mut_ptr();
@@ -122,9 +133,9 @@ impl Scanner {
             let (mut ps, mut pq, mut pn, mut po) = (1u64 << 63, 0u64, 1u64 << 63, 0u64);
             let (mut cl, mut cb) = (0u8, 0u8);
             let mut b = pos;
-            let mut cur = block(data, b, lim);
+            let mut cur = block::<W>(data, b, lim);
             while b < lim {
-                let nxt = if b + 64 < lim { block(data, b + 64, lim) } else { (0, 0, 0) };
+                let nxt = if b + 64 < lim { block::<W>(data, b + 64, lim) } else { (0, 0, 0) };
                 let (sep, q, n) = cur;
                 let s1 = (sep << 1) | (ps >> 63);
                 let s2 = (sep << 2) | (ps >> 62);
@@ -217,7 +228,14 @@ impl Scanner {
 /// end directly, the rest from a padded copy (with a `\n` added when the
 /// file does not end with one). `each` gets the line's base pointer.
 #[inline(always)]
-pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usize, mut each: impl FnMut(*const u8, &[u32; N], &[u32; N])) {
+pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usize, each: impl FnMut(*const u8, &[u32; N], &[u32; N])) {
+    scan_file_w::<N, false>(sc, file, s, e, each)
+}
+
+/// `scan_file`, with AVX-512BW block masks when `W` (the caller must run on
+/// such a CPU and be compiled with that feature for the masks to inline).
+#[inline(always)]
+pub fn scan_file_w<const N: usize, const W: bool>(sc: &mut Scanner, file: &[u8], s: usize, e: usize, mut each: impl FnMut(*const u8, &[u32; N], &[u32; N])) {
     let len = file.len();
     let safe = len.saturating_sub(PAD + 64);
     let mut mid = e;
@@ -234,7 +252,7 @@ pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usi
     }
     if s.max(PAD) == s && mid > s {
         let p = file.as_ptr();
-        unsafe { sc.scan::<N>(p, s, mid, |a, b| each(p, a, b)) };
+        unsafe { sc.scan::<N, W>(p, s, mid, |a, b| each(p, a, b)) };
     } else {
         mid = s;
     }
@@ -248,7 +266,7 @@ pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usi
             end += 1;
         }
         let p = buf.as_ptr();
-        unsafe { sc.scan::<N>(p, PAD, end, |a, b| each(p, a, b)) };
+        unsafe { sc.scan::<N, W>(p, PAD, end, |a, b| each(p, a, b)) };
     }
 }
 
