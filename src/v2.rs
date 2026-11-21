@@ -288,6 +288,7 @@ struct AState {
     dd: Scatter16<Dd>,
     pc: Scatter<PCk, 8>,
     sc: Scanner,
+    buf: Vec<u8>,
     bad: bool,
     sink: u64,
 }
@@ -918,17 +919,61 @@ pub fn run() -> bool {
             dd: Scatter16::new(p1, per_dd),
             pc: Scatter::new(p2, per_pe / 4),
             sc: Scanner::new(),
+            buf: Vec::new(),
             bad: false,
             sink: 0,
         })
         .collect();
+    let readio = env("READIO", "0") == "1";
+    let open = |dir: &str| -> Vec<std::fs::File> {
+        list_csv(&data.join(dir)).iter().map(|p| std::fs::File::open(p).expect("open")).collect()
+    };
+    let files: [Vec<std::fs::File>; 3] = if readio { [open("links"), open("events"), open("clicks")] } else { [vec![], vec![], vec![]] };
+    let maps = [&link_maps, &event_maps, &click_maps];
     run_jobs(&mut a_states, jobs.len(), |st, j| {
         let (kind, fi, s, e) = jobs[j];
-        match kind {
-            0 => parse_links(link_maps[fi].as_ref().unwrap(), s, e, &links, &mut st.sc),
-            1 => parse_events(event_maps[fi].as_ref().unwrap(), s, e, &ctx, st),
-            _ => parse_clicks(click_maps[fi].as_ref().unwrap(), s, e, &ctx, st),
+        let mut run = |st: &mut AState, data: &[u8], s: usize, e: usize| match kind {
+            0 => parse_links(data, s, e, &links, &mut st.sc),
+            1 => parse_events(data, s, e, &ctx, st),
+            _ => parse_clicks(data, s, e, &ctx, st),
+        };
+        if !readio {
+            run(st, maps[kind as usize][fi].as_ref().unwrap(), s, e);
+            return;
         }
+        // Read the job's lines through a small reused buffer, a window at a time.
+        let f = &files[kind as usize][fi];
+        let size = maps[kind as usize][fi].as_ref().unwrap().len();
+        let mut buf = std::mem::take(&mut st.buf);
+        let mut pos = s;
+        while pos < e {
+            let mut want = (e - pos).min(256 << 10);
+            loop {
+                if buf.len() < want + 2 * tok::PAD + 128 {
+                    buf.resize(want + 2 * tok::PAD + 128, 0);
+                }
+                std::os::unix::fs::FileExt::read_exact_at(f, &mut buf[tok::PAD..tok::PAD + want], pos as u64).expect("read");
+                let mut used = want;
+                if pos + want < e {
+                    match memchr::memrchr(b'\n', &buf[tok::PAD..tok::PAD + want]) {
+                        Some(x) => used = x + 1,
+                        None => {
+                            want = (want * 2).min(e - pos);
+                            continue;
+                        }
+                    }
+                }
+                let mut end = tok::PAD + used;
+                if pos + used == size && buf[end - 1] != b'\n' {
+                    buf[end] = b'\n';
+                    end += 1;
+                }
+                run(st, &buf, tok::PAD, end);
+                pos += used;
+                break;
+            }
+        }
+        st.buf = buf;
     });
     a_states.iter_mut().for_each(|s| {
         s.pe.flush();
