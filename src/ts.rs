@@ -231,6 +231,58 @@ impl FastTs {
         None
     }
 
+    /// Epoch seconds of an F1 (`n == 20`) or F2 (`n == 25`) value at `p`
+    /// (24 bytes readable), branch-free on the common path; None means "not
+    /// handled here" (the caller then uses `parse`, exact for everything).
+    #[inline(always)]
+    pub unsafe fn dt_secs(&self, p: *const u8, n: usize) -> Option<i64> {
+        let key = (p as *const u64).read_unaligned();
+        let b = (p.add(8) as *const u64).read_unaligned();
+        let c = (p.add(16) as *const u64).read_unaligned();
+        // b = "DDTHH:MM", c = ":SS" then Z, or "+HH:MM".
+        let d = b ^ 0x3030_0030_3000_3030;
+        let e = c ^ 0x3000_3030_0030_3000;
+        let shape_b = (b & 0x0000_FF00_00FF_0000) == 0x0000_3A00_0054_0000;
+        let dig_b = ((d.wrapping_add(0x7676_0076_7600_7676)) | d) & 0x8080_0080_8000_8080 == 0;
+        // Seconds digits are bytes 1, 2 of c; offset digits bytes 4, 5, 7 and (byte 8 =) p[24].
+        let dig_s = ((e.wrapping_add(0x0000_0000_0076_7600)) | e) & 0x0000_0000_0080_8000 == 0;
+        let colon = (c & 0xFF) == 0x3A;
+        let byte = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as u32;
+        let dd = byte(d, 0) * 10 + byte(d, 1);
+        let hh = byte(d, 3) * 10 + byte(d, 4);
+        let mm = byte(d, 6) * 10 + byte(d, 7);
+        let ss = byte(e, 1) * 10 + byte(e, 2);
+        let mut base = 0i64;
+        let mut first = 1u32;
+        let mut last = 0u32;
+        for i in 0..6 {
+            let hit = key == self.prefixes[i].0;
+            base = if hit { self.prefixes[i].1 } else { base };
+            first = if hit { self.prefixes[i].2 } else { first };
+            last = if hit { self.prefixes[i].3 } else { last };
+        }
+        let ok = shape_b & dig_b & dig_s & colon & (hh <= 23) & (mm <= 59) & (ss <= 59) & (dd >= first) & (dd <= last);
+        let mut secs = (base + dd as i64 - 1) * 86_400 + (hh * 3_600 + mm * 60 + ss) as i64;
+        let zone = byte(c, 3);
+        if n == 20 {
+            if !(ok & (zone == b'Z' as u32)) {
+                return None;
+            }
+            return Some(secs);
+        }
+        // F2: sign, HH, ':', MM.
+        let o = [byte(e, 4), byte(e, 5), byte(e, 7), (*p.add(24) as u32).wrapping_sub(b'0' as u32)];
+        let odig = o.iter().all(|&x| x <= 9);
+        let (oh, om) = (o[0] * 10 + o[1], o[2] * 10 + o[3]);
+        let sign = zone == b'+' as u32;
+        if !(ok & odig & (sign | (zone == b'-' as u32)) & (byte(c, 6) == b':' as u32) & (oh <= 23) & (om <= 59)) {
+            return None;
+        }
+        let off = (oh * 3_600 + om * 60) as i64;
+        secs -= if sign { off } else { -off };
+        Some(secs)
+    }
+
     #[inline(always)]
     pub fn parse(&self, s: &[u8]) -> Option<i64> {
         if let Some(v) = self.f1_swar(s) {
@@ -319,10 +371,32 @@ mod fast_tests {
             }
             cases.push("1791071890000".into());
             cases.push("2028-02-2a".into());
+            let dt = |t: &[u8]| -> Option<i64> {
+                if t.len() != 20 && t.len() != 25 {
+                    return None;
+                }
+                let mut buf = t.to_vec();
+                buf.extend_from_slice(&[0xAA; 32]);
+                unsafe { fast.dt_secs(buf.as_ptr(), t.len()) }.map(|s| s * 1000)
+            };
             for c in &cases {
+                if let Some(v) = dt(c.as_bytes()) {
+                    assert_eq!(Some(v), parse_ts(c.as_bytes()), "dt {}", c);
+                }
                 assert_eq!(fast.parse(c.as_bytes()), parse_ts(c.as_bytes()), "{}", c);
                 if let Some(v) = fast.f1_swar(c.as_bytes()) {
                     assert_eq!(Some(v), parse_ts(c.as_bytes()), "swar {}", c);
+                }
+            }
+            assert!(!lo.starts_with("2028") || (dt(b"2028-02-29T12:34:56Z").is_some() && dt(b"2028-02-29T12:34:56+05:30").is_some()));
+            let good2 = b"2028-02-29T12:34:56-09:45";
+            for i in 0..25 {
+                for v in 0..=255u8 {
+                    let mut t = *good2;
+                    t[i] = v;
+                    if let Some(x) = dt(&t) {
+                        assert_eq!(Some(x), parse_ts(&t), "dt2 {:?}", String::from_utf8_lossy(&t));
+                    }
                 }
             }
             // Every byte position of a valid F1 replaced by every byte value.
@@ -333,6 +407,9 @@ mod fast_tests {
                     t[i] = v;
                     if let Some(x) = fast.f1_swar(&t) {
                         assert_eq!(Some(x), parse_ts(&t), "swar {:?}", String::from_utf8_lossy(&t));
+                    }
+                    if let Some(x) = dt(&t) {
+                        assert_eq!(Some(x), parse_ts(&t), "dt {:?}", String::from_utf8_lossy(&t));
                     }
                     assert_eq!(fast.parse(&t), parse_ts(&t));
                 }

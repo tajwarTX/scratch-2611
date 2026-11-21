@@ -306,7 +306,29 @@ unsafe fn ts_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i64> {
     if (1..=16).contains(&n) {
         return fast::digits16(p.add(n), n).map(|v| v as i64);
     }
+    if n == 20 || n == 25 {
+        if let Some(s) = ctx.fast_ts.dt_secs(p, n) {
+            return Some(s * 1000);
+        }
+    }
     ctx.fast_ts.parse(std::slice::from_raw_parts(p, n))
+}
+
+/// An ingest_ts as whole seconds since the window start; None if it is not
+/// a whole second within i32 range (the fast pipeline then gives up).
+#[inline(always)]
+unsafe fn ingest_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i32> {
+    let ws_s = ctx.ws / 1000;
+    if n == 20 {
+        if let Some(s) = ctx.fast_ts.dt_secs(p, n) {
+            return i32::try_from(s - ws_s).ok();
+        }
+    }
+    let ms = ts_at(ctx, p, n)?;
+    if ms % 1000 != 0 {
+        return None;
+    }
+    i32::try_from(ms / 1000 - ws_s).ok()
 }
 
 #[inline(never)]
@@ -328,15 +350,17 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
             return;
         }
         let id = key_at(at(0), ln(0));
-        let ingest_ms = ts_at(ctx, at(3), ln(3)).unwrap_or(i64::MAX);
+        let ingest = match ingest_at(ctx, at(3), ln(3)) {
+            Some(x) => x,
+            None => {
+                *bad = true;
+                0
+            }
+        };
+        let ingest_ms = ws + ingest as i64 * 1000;
         if abl == 1 {
             *sink += id ^ ingest_ms as u64;
             return;
-        }
-        let rel = ingest_ms.saturating_sub(ws);
-        let ingest = (rel / 1000) as i32;
-        if rel % 1000 != 0 || rel / 1000 != ingest as i64 {
-            *bad = true;
         }
         let mut loc = NONE;
         'valid: {
@@ -774,7 +798,7 @@ pub fn run() -> bool {
     let ws = parse_ts(manifest_value(&manifest, "window_start").expect("window_start").as_bytes()).expect("ws");
     let we = parse_ts(manifest_value(&manifest, "window_end").expect("window_end").as_bytes()).expect("we");
     let base = ws - REACH;
-    if we <= ws || we - base >= u32::MAX as i64 - 1 {
+    if we <= ws || we - base >= u32::MAX as i64 - 1 || ws % 1000 != 0 {
         return false;
     }
     let day_lo = ws.div_euclid(DAY);
@@ -857,21 +881,48 @@ pub fn run() -> bool {
     let (p1, p2) = (1usize << ctx.p1_bits, 1usize << ctx.p2_bits);
     log!(t0, "setup: {} threads, {} MB events, p1={} p2={}", threads, event_bytes >> 20, p1, p2);
 
-    // L: links, then the redirects of every linked ID that is not its person's name.
+    // A: parse links (first, into the shared union-find), events and clicks, all in one pool.
     let links = Links::new(link_bytes / 20 + 64);
-    let mut rd: Vec<Scatter16<Rd>> = Vec::new();
+    let mut jobs: Vec<(u8, usize, usize, usize)> = Vec::new();
+    for (kind, maps) in [(0u8, &link_maps), (1, &event_maps), (2, &click_maps)] {
+        let mut js = Vec::new();
+        chunks(maps, Job::Events, &mut js);
+        jobs.extend(js.into_iter().filter_map(|j| match j {
+            Job::Events(fi, s, e) => Some((kind, fi, s, e)),
+            _ => None,
+        }));
+    }
+    let per_pe = est_events / (threads * p2) * 5 / 4 + 64;
+    let per_dd = est_events / (threads * p1) * 5 / 4 + 64;
+    let mut a_states: Vec<AState> = (0..threads)
+        .map(|t| AState {
+            tid: t as u32,
+            pe: Scatter16::new(p2, per_pe),
+            dd: Scatter16::new(p1, per_dd),
+            pc: Scatter::new(p2, per_pe / 4),
+            sc: Scanner::new(),
+            bad: false,
+            sink: 0,
+        })
+        .collect();
+    run_jobs(&mut a_states, jobs.len(), |st, j| {
+        let (kind, fi, s, e) = jobs[j];
+        match kind {
+            0 => parse_links(link_maps[fi].as_ref().unwrap(), s, e, &links, &mut st.sc),
+            1 => parse_events(event_maps[fi].as_ref().unwrap(), s, e, &ctx, st),
+            _ => parse_clicks(click_maps[fi].as_ref().unwrap(), s, e, &ctx, st),
+        }
+    });
+    a_states.iter_mut().for_each(|s| {
+        s.pe.flush();
+        s.dd.flush();
+        s.pc.flush();
+    });
+    // The redirects of every linked ID that is not its person's name.
+    let mut rd: Vec<Scatter16<Rd>>;
     {
-        let mut jobs = Vec::new();
-        chunks(&link_maps, Job::Events, &mut jobs);
-        let mut st: Vec<Scanner> = (0..threads).map(|_| Scanner::new()).collect();
-        run_jobs(&mut st, jobs.len(), |sc, j| {
-            if let Job::Events(fi, s, e) = jobs[j] {
-                parse_links(link_maps[fi].as_ref().unwrap(), s, e, &links, sc);
-            }
-        });
         let slots = links.slots.len();
         let per = slots.div_ceil(threads * 4);
-        let p2 = 1usize << ctx.p2_bits;
         let p2b = ctx.p2_bits;
         rd = (0..threads).map(|_| Scatter16::new(p2, link_bytes / 20 / (threads * p2) + 64)).collect();
         run_jobs(&mut rd, slots.div_ceil(per), |r, j| {
@@ -887,35 +938,6 @@ pub fn run() -> bool {
         });
         rd.iter_mut().for_each(|r| r.flush());
     }
-    log!(t0, "links");
-
-    // A: parse.
-    let mut jobs = Vec::new();
-    chunks(&event_maps, Job::Events, &mut jobs);
-    chunks(&click_maps, Job::Clicks, &mut jobs);
-    let per_pe = est_events / (threads * p2) * 5 / 4 + 64;
-    let per_dd = est_events / (threads * p1) * 5 / 4 + 64;
-    let mut a_states: Vec<AState> = (0..threads)
-        .map(|t| AState {
-            tid: t as u32,
-            pe: Scatter16::new(p2, per_pe),
-            dd: Scatter16::new(p1, per_dd),
-            pc: Scatter::new(p2, per_pe / 4),
-            sc: Scanner::new(),
-            bad: false,
-            sink: 0,
-        })
-        .collect();
-    run_jobs(&mut a_states, jobs.len(), |st, j| match jobs[j] {
-        Job::Events(fi, s, e) => parse_events(event_maps[fi].as_ref().unwrap(), s, e, &ctx, st),
-        Job::Clicks(fi, s, e) => parse_clicks(click_maps[fi].as_ref().unwrap(), s, e, &ctx, st),
-        Job::Links => {}
-    });
-    a_states.iter_mut().for_each(|s| {
-        s.pe.flush();
-        s.dd.flush();
-        s.pc.flush();
-    });
     if a_states.iter().any(|s| s.bad) {
         eprintln!("an assumption of the fast pipeline does not hold");
         return false;
