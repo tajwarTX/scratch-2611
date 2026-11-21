@@ -619,13 +619,14 @@ struct CState {
     ev_tmp: Vec<u64>,
     ck_tmp: Vec<Ck>,
     pmap: LocalMap,
-    rmap: LocalMap,
     roots: Vec<u64>,
     persons: Vec<u64>,
     local: Vec<u32>,
     ev_start: Vec<u32>,
     ck_start: Vec<u32>,
     cursor: Vec<u32>,
+    cursor2: Vec<u32>,
+    runs: Vec<[u32; 6]>,
     rows: Vec<UserRow>,
     acc: Vec<[u64; 4]>,
     asst: Vec<u64>,
@@ -858,7 +859,8 @@ fn process_person(person: u64, evs: &[u64], cks: &[Ck], ctx: &Ctx, w: &mut Walk)
     w.active.clear();
 }
 
-/// A linked ID whose person is another ID: where its rows must go.
+/// A linked ID (one that appears in a link): its person, which is the ID
+/// itself for the set's smallest ID.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Rd {
@@ -866,207 +868,47 @@ struct Rd {
     root: u64,
 }
 
-/// Phase C state: rows of linked IDs, re-keyed by person and re-partitioned.
+/// Per-thread rows of linked IDs, by their person's partition, one run per
+/// ID: in `ev` the person, the run's counts (events << 32 | clicks) and its
+/// event keys; in `ck` its clicks.
 struct MState {
-    map: LocalMap,
-    roots: Vec<u64>,
-    mv: Scatter16<PEv>,
-    mvc: Scatter<PCk, 8>,
+    ev: Vec<Vec<u64>>,
+    ck: Vec<Vec<Ck>>,
+    nruns: Vec<u32>,
 }
-
-/// Loads partition `u`'s redirects into `map` (ID -> index into `roots`).
-fn load_redirects(rd: &[Scatter16<Rd>], u: usize, map: &mut LocalMap, roots: &mut Vec<u64>) -> bool {
-    let n: usize = rd.iter().map(|r| r.len(u)).sum();
-    roots.clear();
-    map.reset(n.max(1));
-    for r in rd {
-        for x in r.records(u) {
-            map.get_or_insert(x.id, roots.len() as u32);
-            roots.push(x.root);
-        }
-    }
-    n != 0
-}
-
-/// C: moves partition `u`'s rows of redirected IDs to their person's partition.
-#[inline(never)]
-fn redirect_partition(ms: &mut MState, a: &[AState], rd: &[Scatter16<Rd>], u: usize, p2: u32) {
-    let MState { map, roots, mv, mvc } = ms;
-    if !load_redirects(rd, u, map, roots) {
-        return;
-    }
-    for s in a {
-        for e in s.pe.records(u) {
-            if e.ts == TOMB {
-                continue;
-            }
-            if let Some(i) = map.get(e.person) {
-                let root = roots[i as usize];
-                mv.push(part(root, p2), PEv { person: root, ..*e });
-            }
-        }
-        for c in &s.pc.parts[u] {
-            if let Some(i) = map.get(c.person) {
-                let root = roots[i as usize];
-                mvc.push(part(root, p2), PCk { person: root, ..*c });
-            }
-        }
-    }
-}
-
-/// Every event row of partition `j`, in a fixed order: own rows not
-/// tombstoned (rows of redirected IDs included), then rows redirected here.
-#[inline(always)]
-fn each_ev(srcs: &[AState], ms: &[MState], j: usize, mut f: impl FnMut(&PEv)) {
-    for s in srcs {
-        for e in s.pe.records(j) {
-            if e.ts != TOMB {
-                f(e);
-            }
-        }
-    }
-    for m in ms {
-        for e in m.mv.records(j) {
-            f(e);
-        }
-    }
-}
-
-#[inline(always)]
-fn each_ck(srcs: &[AState], ms: &[MState], j: usize, mut f: impl FnMut(&PCk)) {
-    for s in srcs {
-        for c in &s.pc.parts[j] {
-            f(c);
-        }
-    }
-    for m in ms {
-        for c in &m.mvc.parts[j] {
-            f(c);
-        }
-    }
-}
-
-/// Group marker: an ID whose rows phase C moved to its person.
-const DEAD: u32 = u32::MAX;
 
 /// Turns per-group counts into group starts (`starts`, one extra at the end)
-/// and leaves each live group's write cursor at its start.
+/// and leaves each group's write cursor at its start.
 fn starts_of(cursor: &mut [u32], starts: &mut Vec<u32>) -> usize {
     starts.clear();
     let mut total = 0u32;
     for c in cursor.iter_mut() {
         starts.push(total);
-        if *c != DEAD {
-            let n = *c;
-            *c = total;
-            total += n;
-        }
+        let n = *c;
+        *c = total;
+        total += n;
     }
     starts.push(total);
     total as usize
 }
 
-/// D: one person partition. Rows are grouped by ID with a counting sort on a
-/// local index; an ID whose rows phase C moved to its person (a redirected
-/// ID) is looked up once per ID, not per row, and its group stays empty.
-#[inline(never)]
-fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scatter16<Rd>], j: usize, ctx: &Ctx) {
-    let CState {
-        evs,
-        cks,
-        ev_tmp,
-        ck_tmp,
-        pmap,
-        rmap,
-        roots,
-        persons,
-        local,
-        ev_start,
-        ck_start,
-        cursor,
-        rows,
-        acc,
-        asst,
-        win,
-        active,
-        pos,
-        act,
-        segs,
-        cats,
-    } = st;
-    let any_rd = load_redirects(rd, j, rmap, roots);
-    let n: usize = srcs.iter().map(|s| s.pe.len(j)).sum::<usize>() + ms.iter().map(|m| m.mv.len(j)).sum::<usize>();
-    pmap.reset(n / 16 + 64);
-    persons.clear();
-    local.clear();
-    local.reserve(n);
-    cursor.clear();
-    each_ev(srcs, ms, j, |e| {
-        let (idx, inserted) = pmap.get_or_insert(e.person, persons.len() as u32);
-        if inserted {
-            persons.push(e.person);
-            cursor.push(0);
-        }
-        unsafe {
-            *cursor.get_unchecked_mut(idx as usize) += 1;
-            let l = local.len();
-            *local.as_mut_ptr().add(l) = idx;
-            local.set_len(l + 1);
-        }
-    });
-    let np = persons.len();
-    if any_rd {
-        for p in 0..np {
-            if rmap.get(persons[p]).is_some() {
-                cursor[p] = DEAD;
-            }
-        }
-    }
-    let total = starts_of(cursor, ev_start);
-    evs.clear();
-    evs.reserve(total);
-    unsafe { evs.set_len(total) };
-    let mut k = 0usize;
-    each_ev(srcs, ms, j, |e| unsafe {
-        let c = cursor.get_unchecked_mut(*local.get_unchecked(k) as usize);
-        k += 1;
-        if *c != DEAD {
-            *evs.get_unchecked_mut(*c as usize) = (e.ts as u64) << 32 | e.pc as u64;
-            *c += 1;
-        }
-    });
-    // Clicks: only those of live IDs with events here.
-    local.clear();
-    for c in cursor.iter_mut() {
-        if *c != DEAD {
-            *c = 0;
-        }
-    }
-    each_ck(srcs, ms, j, |c| {
-        let idx = match pmap.get(c.person) {
-            Some(i) if cursor[i as usize] != DEAD => {
-                cursor[i as usize] += 1;
-                i
-            }
-            _ => NONE,
-        };
-        local.push(idx);
-    });
-    let total = starts_of(cursor, ck_start);
-    cks.clear();
-    cks.resize(total, Ck::default());
-    let mut k = 0usize;
-    each_ck(srcs, ms, j, |c| unsafe {
-        let idx = *local.get_unchecked(k);
-        k += 1;
-        if idx != NONE {
-            let p = cursor.get_unchecked_mut(idx as usize);
-            *cks.get_unchecked_mut(*p as usize) = Ck { id: c.id, ts: c.ts, camp: c.camp };
-            *p += 1;
-        }
-    });
+/// Appends group index `idx` to `local` (capacity reserved by the caller).
+#[inline(always)]
+unsafe fn push_local(local: &mut Vec<u32>, idx: u32) {
+    let l = local.len();
+    *local.as_mut_ptr().add(l) = idx;
+    local.set_len(l + 1);
+}
+
+/// Sorts and walks groups `from..` of the grouped rows in `st`.
+fn walk_groups(st: &mut CState, from: usize, ctx: &Ctx) {
+    let CState { evs, cks, ev_tmp, ck_tmp, persons, ev_start, ck_start, rows, acc, asst, win, active, pos, act, segs, cats, .. } = st;
     let mut w = Walk { rows, acc, asst, win, active, pos, act, segs, cats };
-    for p in 0..np {
+    let skip = SKIP.load(Ordering::Relaxed);
+    if skip >= 2 {
+        return;
+    }
+    for p in from..persons.len() {
         let (es, ee) = (ev_start[p] as usize, ev_start[p + 1] as usize);
         if es == ee {
             continue;
@@ -1083,8 +925,196 @@ fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scat
         } else {
             radix_sort(pc, ck_tmp, |c| c.ts);
         }
-        process_person(persons[p], pe, pc, ctx, &mut w);
+        if skip == 0 {
+            process_person(persons[p], pe, pc, ctx, &mut w);
+        }
     }
+}
+
+static SKIP: AtomicU32 = AtomicU32::new(0);
+
+/// D1: one person partition's own rows, grouped by ID with a counting sort on
+/// a local index. Linked IDs (this partition's redirect records, roots
+/// included) take the first groups; their rows, re-keyed by person, go to
+/// the person's partition for D2. Every other ID is a person on its own and
+/// is walked here.
+#[inline(never)]
+fn process_partition(st: &mut CState, mv: &mut MState, srcs: &[AState], rd: &[Scatter16<Rd>], j: usize, ctx: &Ctx) {
+    let p2 = ctx.p2_bits;
+    let nl;
+    {
+        let CState { evs, cks, pmap, persons, roots, local, ev_start, ck_start, cursor, .. } = &mut *st;
+        let nrd: usize = rd.iter().map(|r| r.len(j)).sum();
+        let n: usize = srcs.iter().map(|s| s.pe.len(j)).sum();
+        pmap.reset(n / 16 + nrd + 64);
+        persons.clear();
+        roots.clear();
+        cursor.clear();
+        for r in rd {
+            for x in r.records(j) {
+                // Redirect records are unique per ID.
+                pmap.get_or_insert(x.id, persons.len() as u32);
+                persons.push(x.id);
+                roots.push(x.root);
+            }
+        }
+        nl = persons.len();
+        cursor.resize(nl, 0);
+        local.clear();
+        local.reserve(n);
+        for s in srcs {
+            for e in s.pe.records(j) {
+                if e.ts == TOMB {
+                    continue;
+                }
+                let (idx, inserted) = pmap.get_or_insert(e.person, persons.len() as u32);
+                if inserted {
+                    persons.push(e.person);
+                    cursor.push(0);
+                }
+                unsafe {
+                    *cursor.get_unchecked_mut(idx as usize) += 1;
+                    push_local(local, idx);
+                }
+            }
+        }
+        let total = starts_of(cursor, ev_start);
+        evs.clear();
+        evs.reserve(total);
+        unsafe { evs.set_len(total) };
+        let mut k = 0usize;
+        for s in srcs {
+            for e in s.pe.records(j) {
+                if e.ts == TOMB {
+                    continue;
+                }
+                unsafe {
+                    let c = cursor.get_unchecked_mut(*local.get_unchecked(k) as usize);
+                    k += 1;
+                    *evs.get_unchecked_mut(*c as usize) = (e.ts as u64) << 32 | e.pc as u64;
+                    *c += 1;
+                }
+            }
+        }
+        // Clicks: those of linked IDs, and of other IDs with events here.
+        let nck: usize = srcs.iter().map(|s| s.pc.parts[j].len()).sum();
+        local.clear();
+        local.reserve(nck);
+        cursor.iter_mut().for_each(|c| *c = 0);
+        for s in srcs {
+            for c in &s.pc.parts[j] {
+                let idx = match pmap.get(c.person) {
+                    Some(i) => {
+                        unsafe { *cursor.get_unchecked_mut(i as usize) += 1 };
+                        i
+                    }
+                    None => NONE,
+                };
+                unsafe { push_local(local, idx) };
+            }
+        }
+        let total = starts_of(cursor, ck_start);
+        cks.clear();
+        cks.reserve(total);
+        unsafe { cks.set_len(total) };
+        let mut k = 0usize;
+        for s in srcs {
+            for c in &s.pc.parts[j] {
+                unsafe {
+                    let idx = *local.get_unchecked(k);
+                    k += 1;
+                    if idx != NONE {
+                        let p = cursor.get_unchecked_mut(idx as usize);
+                        *cks.get_unchecked_mut(*p as usize) = Ck { id: c.id, ts: c.ts, camp: c.camp };
+                        *p += 1;
+                    }
+                }
+            }
+        }
+        // Linked IDs' rows move to their person's partition.
+        // A run: the person, its counts (events << 32 | clicks), its event keys.
+        for g in 0..nl {
+            let (es, ee) = (ev_start[g] as usize, ev_start[g + 1] as usize);
+            let (cs, ce) = (ck_start[g] as usize, ck_start[g + 1] as usize);
+            if es == ee && cs == ce {
+                continue;
+            }
+            let root = roots[g];
+            let pp = part(root, p2);
+            let v = unsafe { mv.ev.get_unchecked_mut(pp) };
+            v.reserve(2 + ee - es);
+            v.push(root);
+            v.push(((ee - es) as u64) << 32 | (ce - cs) as u64);
+            v.extend_from_slice(&evs[es..ee]);
+            if ce > cs {
+                unsafe { mv.ck.get_unchecked_mut(pp) }.extend_from_slice(&cks[cs..ce]);
+            }
+            mv.nruns[pp] += 1;
+        }
+    }
+    walk_groups(st, nl, ctx);
+}
+
+/// D2: one partition's linked persons, from the runs D1 moved here: per run
+/// one person lookup, then its events and clicks are copied whole.
+#[inline(never)]
+fn process_moved(st: &mut CState, ms: &[MState], j: usize, ctx: &Ctx) {
+    {
+        let CState { evs, cks, pmap, persons, runs, ev_start, ck_start, cursor, cursor2, .. } = &mut *st;
+        let nr: usize = ms.iter().map(|m| m.nruns[j] as usize).sum();
+        if nr == 0 {
+            return;
+        }
+        pmap.reset(nr / 2 + 64);
+        persons.clear();
+        cursor.clear();
+        cursor2.clear();
+        runs.clear();
+        runs.reserve(nr);
+        for (t, m) in ms.iter().enumerate() {
+            let v = &m.ev[j];
+            let (mut i, mut co) = (0usize, 0u32);
+            while i < v.len() {
+                let (root, h) = unsafe { (*v.get_unchecked(i), *v.get_unchecked(i + 1)) };
+                let (nev, nck) = ((h >> 32) as u32, h as u32);
+                let (idx, inserted) = pmap.get_or_insert(root, persons.len() as u32);
+                if inserted {
+                    persons.push(root);
+                    cursor.push(0);
+                    cursor2.push(0);
+                }
+                unsafe {
+                    *cursor.get_unchecked_mut(idx as usize) += nev;
+                    *cursor2.get_unchecked_mut(idx as usize) += nck;
+                }
+                runs.push([idx, t as u32, i as u32 + 2, nev, co, nck]);
+                i += 2 + nev as usize;
+                co += nck;
+            }
+        }
+        let total = starts_of(cursor, ev_start);
+        evs.clear();
+        evs.reserve(total);
+        unsafe { evs.set_len(total) };
+        let total = starts_of(cursor2, ck_start);
+        cks.clear();
+        cks.reserve(total);
+        unsafe { cks.set_len(total) };
+        for &[idx, t, eo, nev, co, nck] in runs.iter() {
+            let m = &ms[t as usize];
+            unsafe {
+                let c = cursor.get_unchecked_mut(idx as usize);
+                std::ptr::copy_nonoverlapping(m.ev[j].as_ptr().add(eo as usize), evs.as_mut_ptr().add(*c as usize), nev as usize);
+                *c += nev;
+                if nck != 0 {
+                    let c = cursor2.get_unchecked_mut(idx as usize);
+                    std::ptr::copy_nonoverlapping(m.ck[j].as_ptr().add(co as usize), cks.as_mut_ptr().add(*c as usize), nck as usize);
+                    *c += nck;
+                }
+            }
+        }
+    }
+    walk_groups(st, 0, ctx);
 }
 
 // ---------------------------------------------------------------- run
@@ -1277,7 +1307,7 @@ pub fn run() -> bool {
         s.dd.flush();
         s.pc.flush();
     });
-    // The redirects of every linked ID that is not its person's name.
+    // Every linked ID and its person (itself for the set's smallest ID).
     let mut rd: Vec<Scatter16<Rd>>;
     {
         let slots = links.slots.len();
@@ -1289,9 +1319,7 @@ pub fn run() -> bool {
                 let k = links.slots[i].key.load(Ordering::Relaxed);
                 if k != 0 {
                     let root = links.key_at(links.find(i as u32));
-                    if root != k {
-                        r.push(part(k, p2b), Rd { id: k, root });
-                    }
+                    r.push(part(k, p2b), Rd { id: k, root });
                 }
             }
         });
@@ -1314,26 +1342,7 @@ pub fn run() -> bool {
     }
     log!(t0, "dedup");
 
-    // C: rows of linked IDs move to their person's partition.
-    let mut m_states: Vec<MState> = (0..threads)
-        .map(|_| MState {
-            map: LocalMap::new(),
-            roots: Vec::new(),
-            mv: Scatter16::new(p2, per_pe / 2),
-            mvc: Scatter::new(p2, per_pe / 8),
-        })
-        .collect();
-    {
-        let (a, rd, p2b) = (&a_states, &rd, ctx.p2_bits);
-        run_jobs(&mut m_states, p2, |ms, u| redirect_partition(ms, a, rd, u, p2b));
-        m_states.iter_mut().for_each(|m| {
-            m.mv.flush();
-            m.mvc.flush();
-        });
-    }
-    log!(t0, "redirect");
-
-    // C: sessions.
+    // D: sessions.
     let ncamp = ctx.campaign_ids.len();
     let mut c_states: Vec<CState> = (0..threads)
         .map(|_| CState {
@@ -1342,13 +1351,14 @@ pub fn run() -> bool {
             ev_tmp: Vec::new(),
             ck_tmp: Vec::new(),
             pmap: LocalMap::new(),
-            rmap: LocalMap::new(),
             roots: Vec::new(),
             persons: Vec::new(),
             local: Vec::new(),
             ev_start: Vec::new(),
             ck_start: Vec::new(),
             cursor: Vec::new(),
+            cursor2: Vec::new(),
+            runs: Vec::new(),
             rows: Vec::new(),
             acc: vec![[0u64; 4]; (ncamp + 1) * ndays],
             asst: vec![0u64; (ncamp + 1) * ndays],
@@ -1360,17 +1370,61 @@ pub fn run() -> bool {
             cats: Vec::new(),
         })
         .collect();
-    {
+    let mut m_states: Vec<MState> = (0..threads)
+        .map(|_| MState {
+            ev: (0..p2).map(|_| Vec::with_capacity(per_pe * 3 / 4)).collect(),
+            ck: (0..p2).map(|_| Vec::with_capacity(per_pe / 4)).collect(),
+            nruns: vec![0; p2],
+        })
+        .collect();
+    let reps: usize = env("DREP", "1").parse().unwrap();
+    SKIP.store(env("SKIP", "0").parse().unwrap(), Ordering::Relaxed);
+    for rep in 0..reps {
+        if rep > 0 {
+            for c in c_states.iter_mut() {
+                c.rows.clear();
+                c.acc.iter_mut().for_each(|x| *x = [0; 4]);
+                c.asst.iter_mut().for_each(|x| *x = 0);
+            }
+            for m in m_states.iter_mut() {
+                m.ev.iter_mut().for_each(|v| v.clear());
+                m.ck.iter_mut().for_each(|v| v.clear());
+                m.nruns.iter_mut().for_each(|x| *x = 0);
+            }
+        }
+        let td = Instant::now();
         let a = &a_states;
         let ctx = &ctx;
+        let rd = &rd;
+        // D1: own rows; persons without links are walked, linked IDs' rows move.
         let mut order: Vec<usize> = (0..p2).collect();
-        let (ms, rd) = (&m_states, &rd);
-        let size = |j: usize| {
-            a.iter().map(|s| s.pe.len(j) + s.pc.parts[j].len()).sum::<usize>()
-                + ms.iter().map(|m| m.mv.len(j) + m.mvc.parts[j].len()).sum::<usize>()
-        };
+        let size = |j: usize| a.iter().map(|s| s.pe.len(j) + s.pc.parts[j].len()).sum::<usize>();
         order.sort_unstable_by_key(|&j| std::cmp::Reverse(size(j)));
-        run_jobs(&mut c_states, p2, |st, k| process_partition(st, a, ms, rd, order[k], ctx));
+        let mut pairs: Vec<(&mut CState, &mut MState)> = c_states.iter_mut().zip(m_states.iter_mut()).collect();
+        run_jobs(&mut pairs, p2, |(st, mv), k| process_partition(st, mv, a, rd, order[k], ctx));
+        drop(pairs);
+        if std::env::var("FSTATS").is_ok() {
+            let mv: usize = (0..p2).map(|j| m_states.iter().map(|m| m.ev[j].len()).sum::<usize>()).sum();
+            let mvc: usize = (0..p2).map(|j| m_states.iter().map(|m| m.ck[j].len()).sum::<usize>()).sum();
+            let ev: usize = (0..p2).map(|j| a.iter().map(|s| s.pe.len(j)).sum::<usize>()).sum();
+            let ck: usize = (0..p2).map(|j| a.iter().map(|s| s.pc.parts[j].len()).sum::<usize>()).sum();
+            let nrd: usize = (0..p2).map(|j| rd.iter().map(|r| r.len(j)).sum::<usize>()).sum();
+            let roots: usize = (0..p2).map(|j| rd.iter().map(|r| r.records(j).iter().filter(|x| x.id == x.root).count()).sum::<usize>()).sum();
+            let np: usize = c_states.iter().map(|c| c.rows.len()).sum();
+            eprintln!("ev {} ck {} moved ev {} ck {} rd {} roots {} rows-so-far {}", ev, ck, mv, mvc, nrd, roots, np);
+        }
+        let td1 = td.elapsed().as_secs_f64();
+        if reps == 1 {
+            log!(t0, "sessions 1");
+        }
+        // D2: linked persons.
+        let ms = &m_states;
+        let size = |j: usize| ms.iter().map(|m| m.ev[j].len() + m.ck[j].len()).sum::<usize>();
+        order.sort_unstable_by_key(|&j| std::cmp::Reverse(size(j)));
+        run_jobs(&mut c_states, p2, |st, k| process_moved(st, ms, order[k], ctx));
+        if reps > 1 {
+            eprintln!("rep {} d1 {:.4} d2 {:.4} total {:.4}", rep, td1, td.elapsed().as_secs_f64() - td1, td.elapsed().as_secs_f64());
+        }
     }
     log!(t0, "sessions");
 
