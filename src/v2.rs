@@ -32,6 +32,7 @@ use crate::fast;
 use crate::keys::{self, any_interned, cmp_key, key_bytes};
 use crate::legacy::{add_cat, chunks, env, list_csv, manifest_value, map_file, prefix, read_pairs, run_jobs, top_category, Job};
 use crate::scatter::Scatter;
+use crate::scatter2::Scatter16;
 use crate::table::{mix, LocalMap, U64Map};
 use crate::ts::{parse_price, parse_ts, FastTs};
 
@@ -287,8 +288,8 @@ fn parse_links(file: &[u8], start: usize, end: usize, links: &Links) {
 
 struct AState {
     tid: u32,
-    pe: Scatter<PEv, 8>,
-    dd: Scatter<Dd, 8>,
+    pe: Scatter16<PEv>,
+    dd: Scatter16<Dd>,
     pc: Scatter<PCk, 8>,
     bad: bool,
 }
@@ -318,7 +319,7 @@ fn for_each_line_fields<'a, const N: usize>(
     let fast_limit = file.len().saturating_sub(fast::LOOKAHEAD);
     while p < end {
         if p <= fast_limit && p >= 16 {
-            if let Some((next, ok)) = fast::tokenize::<N>(file, p, &mut ranges) {
+            if let Some((next, ok)) = fast::tokenize2::<N>(file, p, &mut ranges) {
                 if ok {
                     for i in 0..N {
                         fields[i] = unsafe { file.get_unchecked(p + ranges[i].0 as usize..p + ranges[i].1 as usize) };
@@ -349,15 +350,19 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, links: &Links,
     let mut ring = [Pend::default(); RING];
     let mut head = 0usize;
     let mut count = 0usize;
+    let nolink = env("NOLINK", "0") == "1";
+    let nodd = env("NODD", "0") == "1";
     let finish = |st: &mut AState, d: &Pend| {
-        let person = links.person(d.user);
+        let person = if nolink { d.user } else { links.person(d.user) };
         let pp = part(person, p2);
-        let idx = st.pe.push_idx(pp, PEv { person, ts: d.ts, pc: d.pc });
+        let idx = st.pe.push(pp, PEv { person, ts: d.ts, pc: d.pc }) as usize;
         if idx > idx_max {
             st.bad = true;
         }
         let loc = loc_hi | ((pp as u32) << ib) | (idx as u32 & ((1 << ib) - 1));
-        st.dd.push(part(d.id, p1), Dd { id: d.id, ingest: d.ingest, loc });
+        if !nodd {
+            st.dd.push(part(d.id, p1), Dd { id: d.id, ingest: d.ingest, loc });
+        }
     };
     for_each_line_fields::<7>(file, start, end, |f, simd| {
         if f[0].is_empty() {
@@ -397,7 +402,9 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, links: &Links,
                 pc |= ctx.category(f[5]) << 24;
             }
             let user = key(f[1], simd);
-            links.prefetch(user);
+            if !nolink {
+                links.prefetch(user);
+            }
             if count == RING {
                 let d = ring[head];
                 finish(st, &d);
@@ -467,20 +474,20 @@ unsafe impl Sync for Bases {}
 
 #[inline(never)]
 fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p2: u32, ib: u32, st: &mut BState) {
-    let n: usize = a.iter().map(|s| s.dd.parts[j].len()).sum();
+    let n: usize = a.iter().map(|s| s.dd.len(j)).sum();
     let cap = (n * 8).max(64).next_power_of_two();
     let mask = cap - 1;
     st.counts.clear();
     st.counts.resize(cap, 0);
     for s in a {
-        for r in &s.dd.parts[j] {
+        for r in s.dd.records(j) {
             let c = unsafe { st.counts.get_unchecked_mut(mix(r.id) as usize & mask) };
             *c = c.saturating_add(1);
         }
     }
     st.cand.clear();
     for s in a {
-        for r in &s.dd.parts[j] {
+        for r in s.dd.records(j) {
             if unsafe { *st.counts.get_unchecked(mix(r.id) as usize & mask) } > 1 {
                 st.cand.push(*r);
             }
@@ -627,13 +634,13 @@ fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk
 fn process_partition(st: &mut CState, srcs: &[AState], j: usize, ctx: &Ctx) {
     let interned = any_interned();
     let CState { evs, cks, pmap, persons, local, ev_start, ck_start, cursor, rows, acc, stamp, serial, cats } = st;
-    let n: usize = srcs.iter().map(|s| s.pe.parts[j].len()).sum();
+    let n: usize = srcs.iter().map(|s| s.pe.len(j)).sum();
     pmap.reset(n / 8 + 16);
     persons.clear();
     local.clear();
     cursor.clear();
     for s in srcs {
-        for e in &s.pe.parts[j] {
+        for e in s.pe.records(j) {
             if e.ts == TOMB {
                 continue;
             }
@@ -653,7 +660,7 @@ fn process_partition(st: &mut CState, srcs: &[AState], j: usize, ctx: &Ctx) {
     evs.resize(ev_start[np] as usize, PEv::default());
     let mut k = 0usize;
     for s in srcs {
-        for e in &s.pe.parts[j] {
+        for e in s.pe.records(j) {
             if e.ts == TOMB {
                 continue;
             }
@@ -786,7 +793,9 @@ pub fn run() -> bool {
 
     let est_events = event_bytes / 80 + 1;
     let tbits = (usize::BITS - (threads.max(2) - 1).leading_zeros()).max(1);
-    let p2_bits = bits_for(est_events, 24 << 10, 10.min(29 - tbits));
+    let per_part: usize = env("PER_PART", "49152").parse().unwrap();
+    crate::scatter2::NT.store(env("SCATTER_NT", "1") == "1", Ordering::Relaxed);
+    let p2_bits = bits_for(est_events, per_part, 10.min(29 - tbits));
     let ctx = Ctx {
         ws,
         we,
@@ -801,7 +810,7 @@ pub fn run() -> bool {
         camp_slow,
         campaign_ids,
         channels,
-        p1_bits: bits_for(est_events, 24 << 10, 12),
+        p1_bits: bits_for(est_events, per_part, 12),
         p2_bits,
         idx_bits: 32 - tbits - p2_bits,
         fast_ts: FastTs::new(ws - REACH - 10 * DAY, we + 10 * DAY),
@@ -810,7 +819,7 @@ pub fn run() -> bool {
     log!(t0, "setup: {} threads, {} MB events, p1={} p2={}", threads, event_bytes >> 20, p1, p2);
 
     // L: links.
-    let links = Links::new(link_bytes / 20 * 2 + 64);
+    let links = Links::new(link_bytes / 20 + 64);
     {
         let mut jobs = Vec::new();
         chunks(&link_maps, Job::Events, &mut jobs);
@@ -843,8 +852,8 @@ pub fn run() -> bool {
     let mut a_states: Vec<AState> = (0..threads)
         .map(|t| AState {
             tid: t as u32,
-            pe: Scatter::new(p2, per_pe),
-            dd: Scatter::new(p1, per_dd),
+            pe: Scatter16::new(p2, per_pe),
+            dd: Scatter16::new(p1, per_dd),
             pc: Scatter::new(p2, per_pe / 4),
             bad: false,
         })
@@ -866,7 +875,7 @@ pub fn run() -> bool {
     log!(t0, "parse");
 
     // B: dedup.
-    let bases = Bases(a_states.iter_mut().map(|s| s.pe.parts.iter_mut().map(|v| v.as_mut_ptr()).collect()).collect());
+    let bases = Bases(a_states.iter_mut().map(|s| (0..p2).map(|pp| s.pe.base_ptr(pp)).collect()).collect());
     {
         let a = &a_states;
         let bases = &bases;
@@ -926,13 +935,21 @@ fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
             let path = user_dir.join(format!("part-{:05}.parquet", t));
             sc.spawn(move || {
                 let rows = &s.rows;
-                let mut buf = Vec::with_capacity(16);
-                let user_id: Vec<ByteArray> = rows
+                // Every user_id in one buffer; the writer gets cheap slices of it.
+                let mut text = Vec::with_capacity(rows.len() * 10);
+                let mut ends = Vec::with_capacity(rows.len());
+                for r in rows {
+                    key_bytes(r.person, &mut text);
+                    ends.push(text.len());
+                }
+                let text = bytes::Bytes::from(text);
+                let mut from = 0;
+                let user_id: Vec<ByteArray> = ends
                     .iter()
-                    .map(|r| {
-                        buf.clear();
-                        key_bytes(r.person, &mut buf);
-                        ByteArray::from(buf.clone())
+                    .map(|&to| {
+                        let b = ByteArray::from(text.slice(from..to));
+                        from = to;
+                        b
                     })
                     .collect();
                 let cat_names: Vec<ByteArray> = ctx.categories.iter().map(|c| ByteArray::from(c.clone())).collect();

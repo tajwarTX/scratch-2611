@@ -31,14 +31,6 @@ impl<T: Copy + Default, const K: usize> Scatter<T, K> {
         }
     }
 
-    /// Like `push`, returning the record's final index in partition `p`.
-    #[inline(always)]
-    pub fn push_idx(&mut self, p: usize, rec: T) -> usize {
-        let idx = unsafe { self.parts.get_unchecked(p).len() + *self.fill.get_unchecked(p) as usize };
-        self.push(p, rec);
-        idx
-    }
-
     /// Moves every staged record to its partition.
     pub fn flush(&mut self) {
         for p in 0..self.fill.len() {

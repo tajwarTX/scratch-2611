@@ -90,6 +90,79 @@ pub fn tokenize<const N: usize>(data: &[u8], p: usize, f: &mut [(u32, u32); N]) 
     Some((next, true))
 }
 
+/// Prefix-xor of a 64-bit mask with one carry-less multiply.
+#[inline(always)]
+fn prefix_xor64(x: u64) -> u64 {
+    unsafe {
+        let v = _mm_clmulepi64_si128(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1), 0);
+        _mm_cvtsi128_si64(v) as u64
+    }
+}
+
+/// `tokenize`, with 64-bit halves, carry-less-multiply prefix-xor, and quote
+/// fixes only at opening quotes. Same contract and results as `tokenize`.
+#[inline(always)]
+pub fn tokenize2<const N: usize>(data: &[u8], p: usize, f: &mut [(u32, u32); N]) -> Option<(usize, bool)> {
+    debug_assert!(p + LOOKAHEAD <= data.len());
+    let (cm, qm, nm) = unsafe { masks128(data.as_ptr().add(p)) };
+    if nm == 0 {
+        return None;
+    }
+    let len = nm.trailing_zeros();
+    let next = p + len as usize + 1;
+    if len == 0 {
+        return Some((next, false));
+    }
+    let range = (1u128 << len) - 1;
+    let c = cm & range;
+    let (clo, chi) = (c as u64, (c >> 64) as u64);
+    if clo.count_ones() + chi.count_ones() != (N - 1) as u32 {
+        return Some((next, false));
+    }
+    let mut i = 0usize;
+    let mut fs = 0u32;
+    let mut w = clo;
+    while w != 0 {
+        let fe = w.trailing_zeros();
+        w &= w - 1;
+        f[i] = (fs, fe);
+        i += 1;
+        fs = fe + 1;
+    }
+    let mut w = chi;
+    while w != 0 {
+        let fe = 64 + w.trailing_zeros();
+        w &= w - 1;
+        f[i] = (fs, fe);
+        i += 1;
+        fs = fe + 1;
+    }
+    f[N - 1] = (fs, len);
+    let q = qm & range;
+    if q != 0 {
+        let (qlo, qhi) = (q as u64, (q >> 64) as u64);
+        let xlo = prefix_xor64(qlo);
+        let xhi = prefix_xor64(qhi) ^ (0u64.wrapping_sub((qlo.count_ones() & 1) as u64));
+        let x = (xlo as u128) | ((xhi as u128) << 64);
+        let open = q & x;
+        let close = q & !x;
+        let starts = (c << 1) | 1;
+        let ends = (c >> 1) | (1u128 << (len - 1));
+        if (open & !starts) | (close & !ends) | (x & c) | ((x >> (len - 1)) & 1) != 0 {
+            return Some((next, false));
+        }
+        let mut o = open;
+        while o != 0 {
+            let pos = o.trailing_zeros();
+            o &= o - 1;
+            let field = (c & ((1u128 << pos) - 1)).count_ones() as usize;
+            f[field].0 += 1;
+            f[field].1 -= 1;
+        }
+    }
+    Some((next, true))
+}
+
 static LEN_MASKS: [[u8; 16]; 17] = {
     let mut t = [[0u8; 16]; 17];
     let mut n = 0;
@@ -210,6 +283,7 @@ mod tests {
         }
         // Random lines over a small alphabet, against the scalar splitter.
         let alphabet = b"a\",";
+        // Lines up to 63 bytes come from the generator below; longer ones test the high half.
         let mut seed = 12345u64;
         for _ in 0..200_000 {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -224,6 +298,12 @@ mod tests {
             buf[32 + line.len()] = b'\n';
             let mut f = [(0u32, 0u32); 3];
             let (_, ok) = tokenize::<3>(&buf, 32, &mut f).unwrap();
+            let mut f2 = [(0u32, 0u32); 3];
+            let (_, ok2) = tokenize2::<3>(&buf, 32, &mut f2).unwrap();
+            assert_eq!(ok, ok2, "{:?}", String::from_utf8_lossy(&line));
+            if ok {
+                assert_eq!(f, f2);
+            }
             let mut g = [&b""[..]; 3];
             let want = split(&line, &mut g);
             assert_eq!(ok, want, "{:?}", String::from_utf8_lossy(&line));
