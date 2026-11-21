@@ -56,6 +56,10 @@ pub fn intern(s: &[u8]) -> u64 {
 }
 
 /// Whether any key so far needed the intern table (so integer order is not byte order).
+pub fn interned_count() -> usize {
+    INTERNER.lock().unwrap().as_ref().map_or(0, |i| i.strings.len())
+}
+
 pub fn any_interned() -> bool {
     ANY_INTERNED.load(AtomicOrdering::Relaxed)
 }

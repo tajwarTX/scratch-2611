@@ -1145,6 +1145,7 @@ fn bits_for(items: usize, per_part: usize, max_bits: u32) -> u32 {
 /// (nothing has been written then).
 pub fn run() -> bool {
     let t0 = Instant::now();
+    SKIPW.store(env("SKIPW", "0").parse().unwrap(), Ordering::Relaxed);
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let out_dir = PathBuf::from(env("OUTPUT_DIR", "/output"));
     let threads: usize = std::env::var("NCPU")
@@ -1255,8 +1256,10 @@ pub fn run() -> bool {
             _ => None,
         }));
     }
-    let per_pe = est_events / (threads * p2) * 5 / 4 + 64;
-    let per_dd = est_events / (threads * p1) * 5 / 4 + 64;
+    log!(t0, "jobs");
+    let r0 = env("RESERVE0", "0") == "1";
+    let per_pe = if r0 { 64 } else { est_events / (threads * p2) * 5 / 4 + 64 };
+    let per_dd = if r0 { 64 } else { est_events / (threads * p1) * 5 / 4 + 64 };
     let mut a_states: Vec<AState> = (0..threads)
         .map(|t| AState {
             tid: t as u32,
@@ -1268,6 +1271,7 @@ pub fn run() -> bool {
             bad: false,
         })
         .collect();
+    log!(t0, "alloc");
     let readio = env("READIO", "0") == "1";
     let open = |dir: &str| -> Vec<std::fs::File> {
         list_csv(&data.join(dir)).iter().map(|p| std::fs::File::open(p).expect("open")).collect()
@@ -1319,11 +1323,13 @@ pub fn run() -> bool {
         }
         st.buf = buf;
     });
+    log!(t0, "pool");
     a_states.iter_mut().for_each(|s| {
         s.pe.flush();
         s.dd.flush();
         s.pc.flush();
     });
+    log!(t0, "flush");
     // Every linked ID and its person (itself for the set's smallest ID).
     let mut rd: Vec<Scatter16<Rd>>;
     {
@@ -1348,6 +1354,7 @@ pub fn run() -> bool {
     }
     log!(t0, "parse");
     if env("PARSEONLY", "0") == "1" {
+        eprintln!("interned={} {}", keys::interned_count(), std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default().lines().filter(|l| l.starts_with("Anonymous") || l.starts_with("AnonHuge")).collect::<Vec<_>>().join(" "));
         return true;
     }
 
@@ -1399,7 +1406,6 @@ pub fn run() -> bool {
         .collect();
     let reps: usize = env("DREP", "1").parse().unwrap();
     SKIP.store(env("SKIP", "0").parse().unwrap(), Ordering::Relaxed);
-    SKIPW.store(env("SKIPW", "0").parse().unwrap(), Ordering::Relaxed);
     for rep in 0..reps {
         if rep > 0 {
             for c in c_states.iter_mut() {
