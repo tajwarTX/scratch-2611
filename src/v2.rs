@@ -283,7 +283,7 @@ fn parse_links(file: &[u8], start: usize, end: usize, links: &Links, sc: &mut Sc
             return;
         }
         let (ka, kb) = (key_at(p.add(s[0] as usize), na), key_at(p.add(s[1] as usize), nb));
-        if ka != kb {
+        if ka != kb && SKIPW.load(Ordering::Relaxed) & 8 == 0 {
             let (a, b) = (links.insert(ka), links.insert(kb));
             links.union(a, b);
         }
@@ -413,6 +413,18 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
             0
         });
         let mut loc = NONE;
+        let sw = SKIPW.load(Ordering::Relaxed);
+        if sw & 3 != 0 {
+            if sw & 1 == 0 {
+                if let Some(ev) = o.ev {
+                    pe.push(part(ev.person, p2), ev);
+                }
+            }
+            if sw & 2 == 0 {
+                dd.push(part(o.id, p1), Dd { id: o.id, ingest, loc });
+            }
+            return;
+        }
         if let Some(ev) = o.ev {
             let pp = part(ev.person, p2);
             let idx = pe.push(pp, ev) as usize;
@@ -494,7 +506,9 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
         };
         let Some(camp) = ctx.campaign(std::slice::from_raw_parts(at(2), ln(2))) else { return };
         let user = key_at(at(1), ln(1));
-        pc.push(part(user, p2), PCk { person: user, id: key_at(at(0), ln(0)), ts: (ts - base) as u32, camp });
+        if SKIPW.load(Ordering::Relaxed) & 4 == 0 {
+            pc.push(part(user, p2), PCk { person: user, id: key_at(at(0), ln(0)), ts: (ts - base) as u32, camp });
+        }
     });
 }
 
@@ -932,6 +946,9 @@ fn walk_groups(st: &mut CState, from: usize, ctx: &Ctx) {
 }
 
 static SKIP: AtomicU32 = AtomicU32::new(0);
+/// Probe only: bits 1 event records, 2 dedup records, 4 click records, 8 link
+/// table inserts are skipped during parse (PARSEONLY runs stop after parse).
+static SKIPW: AtomicU32 = AtomicU32::new(0);
 
 /// D1: one person partition's own rows, grouped by ID with a counting sort on
 /// a local index. Linked IDs (this partition's redirect records, roots
@@ -1330,6 +1347,9 @@ pub fn run() -> bool {
         return false;
     }
     log!(t0, "parse");
+    if env("PARSEONLY", "0") == "1" {
+        return true;
+    }
 
     // B: dedup.
     let bases = Bases(a_states.iter_mut().map(|s| (0..p2).map(|pp| s.pe.base_ptr(pp)).collect()).collect());
@@ -1379,6 +1399,7 @@ pub fn run() -> bool {
         .collect();
     let reps: usize = env("DREP", "1").parse().unwrap();
     SKIP.store(env("SKIP", "0").parse().unwrap(), Ordering::Relaxed);
+    SKIPW.store(env("SKIPW", "0").parse().unwrap(), Ordering::Relaxed);
     for rep in 0..reps {
         if rep > 0 {
             for c in c_states.iter_mut() {
