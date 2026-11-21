@@ -112,6 +112,9 @@ struct Ctx {
 impl Ctx {
     #[inline]
     fn category(&self, product: &[u8]) -> u32 {
+        if product.is_empty() {
+            return self.unknown_cat;
+        }
         let found = match pack(product) {
             Some(k) => self.product_fast.get(k).map(|v| v as u32),
             None => self.product_slow.get(product).copied(),
@@ -121,6 +124,9 @@ impl Ctx {
 
     #[inline]
     fn campaign(&self, c: &[u8]) -> Option<u32> {
+        if c.is_empty() {
+            return None;
+        }
         match pack(c) {
             Some(k) => self.camp_fast.get(k).map(|v| v as u32),
             None => self.camp_slow.get(c).copied(),

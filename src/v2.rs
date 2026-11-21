@@ -26,7 +26,6 @@ use std::time::Instant;
 
 use memmap2::Mmap;
 
-use crate::csv::split;
 use crate::tok::{self, Scanner};
 use crate::fast;
 use crate::keys::{self, any_interned, cmp_key, key_bytes};
@@ -112,7 +111,10 @@ struct Ctx {
 impl Ctx {
     #[inline]
     fn category(&self, product: &[u8]) -> u32 {
-        let found = match keys::pack(product) {
+        if product.is_empty() {
+            return self.unknown_cat;
+        }
+        let found = match fast::pack(product.as_ptr(), product.len()) {
             Some(k) => self.product_fast.get(k).map(|v| v as u32),
             None => self.product_slow.get(product).copied(),
         };
@@ -121,7 +123,10 @@ impl Ctx {
 
     #[inline]
     fn campaign(&self, c: &[u8]) -> Option<u32> {
-        match keys::pack(c) {
+        if c.is_empty() {
+            return None;
+        }
+        match fast::pack(c.as_ptr(), c.len()) {
             Some(k) => self.camp_fast.get(k).map(|v| v as u32),
             None => self.camp_slow.get(c).copied(),
         }

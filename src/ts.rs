@@ -164,6 +164,16 @@ mod tests {
 pub struct FastTs {
     prefixes: [(u64, i64, u32, u32); 6],
     count: usize,
+    /// The prefixes again, indexed by (last year digit, month) for `dt_secs`.
+    by_ym: Vec<(u64, i64, u32, u32)>,
+}
+
+/// `dt_secs`'s table slot for a `YYYY-MM-` word.
+#[inline(always)]
+fn ym_slot(key: u64) -> usize {
+    let y4 = ((key >> 24) & 0xF) as usize;
+    let m = (((key >> 40) & 0xF) * 10 + ((key >> 48) & 0xF)) as usize & 15;
+    y4 * 16 + m
 }
 
 impl FastTs {
@@ -187,7 +197,11 @@ impl FastTs {
             count += 1;
             day += (last - d as u32) as i64 + 1;
         }
-        FastTs { prefixes, count }
+        let mut by_ym = vec![(0u64, 0i64, 1u32, 0u32); 256];
+        for &e in &prefixes[..count] {
+            by_ym[ym_slot(e.0)] = e;
+        }
+        FastTs { prefixes, count, by_ym }
     }
 
     /// F1 with word-at-a-time checks; None means "not handled here" (the
@@ -252,15 +266,9 @@ impl FastTs {
         let hh = byte(d, 3) * 10 + byte(d, 4);
         let mm = byte(d, 6) * 10 + byte(d, 7);
         let ss = byte(e, 1) * 10 + byte(e, 2);
-        let mut base = 0i64;
-        let mut first = 1u32;
-        let mut last = 0u32;
-        for i in 0..6 {
-            let hit = key == self.prefixes[i].0;
-            base = if hit { self.prefixes[i].1 } else { base };
-            first = if hit { self.prefixes[i].2 } else { first };
-            last = if hit { self.prefixes[i].3 } else { last };
-        }
+        let t = *self.by_ym.get_unchecked(ym_slot(key));
+        let hit = t.0 == key;
+        let (base, first, last) = (t.1, if hit { t.2 } else { 99 }, t.3);
         let ok = shape_b & dig_b & dig_s & colon & (hh <= 23) & (mm <= 59) & (ss <= 59) & (dd >= first) & (dd <= last);
         let mut secs = (base + dd as i64 - 1) * 86_400 + (hh * 3_600 + mm * 60 + ss) as i64;
         let zone = byte(c, 3);
