@@ -282,7 +282,8 @@ impl Links {
 }
 
 fn parse_links(file: &[u8], start: usize, end: usize, links: &Links, sc: &mut Scanner) {
-    tok::scan_file::<2>(sc, file, start, end, |p, s, e| unsafe {
+    tok::scan_file::<2>(sc, file, start, end, #[inline(always)]
+    |p, s, e| unsafe {
         let (na, nb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
         if na == 0 || nb == 0 {
             return;
@@ -506,7 +507,8 @@ fn conv_bench(ctx: &Ctx, maps: &[Option<Mmap>]) {
 fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState) {
     let (lo, hi, base, p2) = (ctx.ws - REACH, ctx.we, ctx.base, ctx.p2_bits);
     let AState { pc, sc, .. } = st;
-    tok::scan_file::<4>(sc, file, start, end, |p, s, e| unsafe {
+    tok::scan_file::<4>(sc, file, start, end, #[inline(always)]
+    |p, s, e| unsafe {
         let at = |i: usize| p.add(s[i] as usize);
         let ln = |i: usize| (e[i] - s[i]) as usize;
         if ln(0) == 0 || ln(1) == 0 {
