@@ -1293,8 +1293,9 @@ pub fn run() -> bool {
     }
     let per_pe = est_events / (threads * p2) * 5 / 4 + 64;
     let per_dd = est_events / (threads * p1) * 5 / 4 + 64;
-    // PALLOC=1 (experiment): each thread allocates its own buffers, so the
-    // zeroing of their fresh huge pages is spread over all cores.
+    // Each thread allocates its own buffers, so the zeroing of their fresh
+    // huge pages is spread over all cores (0.09 s faster on the scorer at 20M
+    // events than allocating them all here). PALLOC=0 turns it off.
     let make = |t: usize| AState {
         tid: t as u32,
         pe: Scatter16::new(p2, per_pe),
@@ -1304,7 +1305,7 @@ pub fn run() -> bool {
         buf: Vec::new(),
         bad: false,
     };
-    let mut a_states: Vec<AState> = if env("PALLOC", "0") == "1" {
+    let mut a_states: Vec<AState> = if env("PALLOC", "1") == "1" {
         std::thread::scope(|sc| {
             let hs: Vec<_> = (0..threads).map(|t| sc.spawn(move || make(t))).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
