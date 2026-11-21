@@ -161,7 +161,7 @@ impl Ctx {
 /// independent of this.
 #[inline(always)]
 fn part(k: u64, bits: u32) -> usize {
-    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
+    (k.wrapping_mul(crate::table::PHI) >> (64 - bits)) as usize
 }
 
 // ---------------------------------------------------------------- links
@@ -973,7 +973,7 @@ fn process_partition(st: &mut CState, mv: &mut MState, srcs: &[AState], rd: &[Sc
         let CState { evs, cks, pmap, persons, roots, local, ev_start, ck_start, cursor, .. } = &mut *st;
         let nrd: usize = rd.iter().map(|r| r.len(j)).sum();
         let n: usize = srcs.iter().map(|s| s.pe.len(j)).sum();
-        pmap.reset(n / 16 + nrd + 64);
+        pmap.reset(n / 16 + nrd + 64, p2);
         persons.clear();
         roots.clear();
         cursor.clear();
@@ -1092,7 +1092,7 @@ fn process_moved(st: &mut CState, ms: &[MState], j: usize, ctx: &Ctx) {
         if nr == 0 {
             return;
         }
-        pmap.reset(nr / 2 + 64);
+        pmap.reset(nr / 2 + 64, ctx.p2_bits);
         persons.clear();
         cursor.clear();
         cursor2.clear();

@@ -170,15 +170,32 @@ pub struct LocalMap {
     vals: Vec<u32>,
     mask: usize,
     len: usize,
+    /// Slot of a key: bits of `key * PHI` below the top `skip` ones (which the
+    /// keys of one partition share), i.e. `(key * PHI << skip) >> shift`.
+    skip: u32,
+    shift: u32,
 }
+
+/// The multiplier of `v2::part`.
+pub const PHI: u64 = 0x9E37_79B9_7F4A_7C15;
 
 impl LocalMap {
     pub fn new() -> Self {
-        LocalMap { keys: Vec::new(), vals: Vec::new(), mask: 0, len: 0 }
+        LocalMap { keys: Vec::new(), vals: Vec::new(), mask: 0, len: 0, skip: 0, shift: 63 }
     }
 
-    pub fn reset(&mut self, expect: usize) {
+    /// The slot `k` hashes to.
+    #[inline(always)]
+    fn slot(&self, k: u64) -> usize {
+        ((k.wrapping_mul(PHI) << self.skip) >> self.shift) as usize
+    }
+
+    /// Empties the map for about `expect` keys that all share the top `skip`
+    /// bits of `key * PHI` (0 if they share none).
+    pub fn reset(&mut self, expect: usize, skip: u32) {
         let cap = (expect * 2).max(64).next_power_of_two();
+        self.skip = skip;
+        self.shift = 64 - cap.trailing_zeros();
         if self.keys.len() != cap {
             self.keys = vec![0; cap];
             self.vals = vec![0; cap];
@@ -195,7 +212,7 @@ impl LocalMap {
         if (self.len + 1) * 2 > self.keys.len() {
             self.grow();
         }
-        let mut i = mix(k) as usize & self.mask;
+        let mut i = self.slot(k);
         loop {
             let sk = unsafe { *self.keys.get_unchecked(i) };
             if sk == k {
@@ -215,7 +232,7 @@ impl LocalMap {
 
     #[inline(always)]
     pub fn get(&self, k: u64) -> Option<u32> {
-        let mut i = mix(k) as usize & self.mask;
+        let mut i = self.slot(k);
         loop {
             let sk = unsafe { *self.keys.get_unchecked(i) };
             if sk == k {
@@ -234,9 +251,10 @@ impl LocalMap {
         self.keys = vec![0; cap];
         self.vals = vec![0; cap];
         self.mask = cap - 1;
+        self.shift = 64 - cap.trailing_zeros();
         for (k, v) in old_keys.into_iter().zip(old_vals) {
             if k != 0 {
-                let mut i = mix(k) as usize & self.mask;
+                let mut i = self.slot(k);
                 while self.keys[i] != 0 {
                     i = (i + 1) & self.mask;
                 }

@@ -526,7 +526,7 @@ fn process_partition(st: &mut CState, srcs: &[BState], j: usize, ctx: &Ctx) {
     let interned = any_interned();
     let CState { evs, cks, pmap, persons, local, ev_start, ck_start, cursor, rows, acc, stamp, serial, cats } = st;
     let n: usize = srcs.iter().map(|s| s.pe.parts[j].len()).sum();
-    pmap.reset(n / 8 + 16);
+    pmap.reset(n / 8 + 16, 0);
     persons.clear();
     local.clear();
     cursor.clear();
