@@ -1391,6 +1391,13 @@ pub fn run() -> bool {
         return false;
     }
     log!(t0, "parse");
+    {
+        // Probe only: largest partition occupancy (read-only).
+        let pev = (0..p2).map(|j| a_states.iter().map(|s| s.pe.len(j)).sum::<usize>()).max().unwrap_or(0);
+        let ddm = (0..p1).map(|j| a_states.iter().map(|s| s.dd.len(j)).sum::<usize>()).max().unwrap_or(0);
+        let one = a_states.iter().map(|s| (0..p2).map(|j| s.pe.len(j)).max().unwrap_or(0)).max().unwrap_or(0);
+        eprintln!("PARTS p1={} p2={} dedup_max_occ={} pev_max_occ={} pev_max_one_thread={} idx_limit={}", p1, p2, ddm, pev, one, 1usize << ctx.idx_bits);
+    }
 
     // B: dedup.
     let bases = Bases(a_states.iter_mut().map(|s| (0..p2).map(|pp| s.pe.base_ptr(pp)).collect()).collect());
