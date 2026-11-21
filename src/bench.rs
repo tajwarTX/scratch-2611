@@ -120,14 +120,57 @@ pub fn run() {
             }
             per(if both { "+ts x2" } else { "+ts x1" }, t, sink);
         }
+        // REPS=k repeats the scan benches and reports the fastest run.
+        let reps: usize = std::env::var("REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let best = |name: &str, run: &mut dyn FnMut() -> u64| {
+            let mut min = f64::MAX;
+            let mut sink = 0;
+            for _ in 0..reps {
+                let t = Instant::now();
+                sink = run();
+                min = min.min(t.elapsed().as_nanos() as f64 / lines as f64);
+            }
+            eprintln!("{:<12} {:>6.1} ns/line   (sink {}, min of {})", name, min, sink % 7, reps);
+        };
         if on("scan") {
-            let t = Instant::now();
-            let mut sink = 0u64;
             let mut sc = crate::tok::Scanner::new();
-            crate::tok::scan_file::<7>(&mut sc, file, start, file.len(), |_, a, b| {
-                sink += (a[3] ^ b[5] ^ a[0] ^ b[6]) as u64;
+            best("scan", &mut || {
+                let mut sink = 0u64;
+                crate::tok::scan_file::<7>(&mut sc, file, start, file.len(), |_, a, b| {
+                    sink += (a[3] ^ b[5] ^ a[0] ^ b[6]) as u64;
+                });
+                sink
             });
-            per("scan", t, sink);
+        }
+        if on("scanall") {
+            // Like scan, but the callback reads every field (as real callers do).
+            let mut sc = crate::tok::Scanner::new();
+            best("scanall", &mut || {
+                let mut sink = 0u64;
+                crate::tok::scan_file::<7>(&mut sc, file, start, file.len(), |_, a, b| {
+                    for i in 0..7 {
+                        sink = sink.wrapping_add((a[i] ^ b[i]) as u64);
+                    }
+                });
+                sink
+            });
+        }
+        if on("read") {
+            // Memory floor: one AVX2 pass over the bytes.
+            let t = Instant::now();
+            let sink = unsafe {
+                use std::arch::x86_64::*;
+                let mut acc = _mm256_setzero_si256();
+                let mut i = start;
+                while i + 64 <= file.len() {
+                    let a = _mm256_loadu_si256(file.as_ptr().add(i) as *const __m256i);
+                    let b = _mm256_loadu_si256(file.as_ptr().add(i + 32) as *const __m256i);
+                    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_xor_si256(a, b), _mm256_setzero_si256()));
+                    i += 64;
+                }
+                _mm256_extract_epi64(acc, 0) as u64
+            };
+            per("read", t, sink);
         }
         if on("tok3") {
             let t = Instant::now();
