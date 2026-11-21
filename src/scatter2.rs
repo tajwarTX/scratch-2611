@@ -12,6 +12,9 @@ pub const K: usize = 8;
 
 /// Experiment switch: non-temporal block stores (default on).
 pub static NT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// Experiment switch: store each record straight into its partition (no
+/// staging block, no copy-out branch); default off.
+pub static DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
@@ -43,6 +46,18 @@ impl<T: Copy + Default> Scatter16<T> {
     #[inline(always)]
     pub fn push(&mut self, p: usize, rec: T) -> u32 {
         unsafe {
+            if DIRECT.load(std::sync::atomic::Ordering::Relaxed) {
+                let idx = *self.count.get_unchecked(p);
+                let dst = self.blocks.get_unchecked_mut(p);
+                if idx as usize == dst.capacity() * K {
+                    // Keep what is written (whole blocks) across the reallocation.
+                    dst.set_len(idx as usize / K);
+                    dst.reserve(dst.len().max(16));
+                }
+                *(dst.as_mut_ptr() as *mut T).add(idx as usize) = rec;
+                *self.count.get_unchecked_mut(p) = idx + 1;
+                return idx;
+            }
             let c = self.count.get_unchecked_mut(p);
             let idx = *c;
             *c = idx + 1;
@@ -77,6 +92,13 @@ impl<T: Copy + Default> Scatter16<T> {
 
     /// Moves every staged block (full or partial) into its partition (call once, at the end).
     pub fn flush(&mut self) {
+        if DIRECT.load(std::sync::atomic::Ordering::Relaxed) {
+            for p in 0..self.count.len() {
+                let blocks = (self.count[p] as usize).div_ceil(K);
+                unsafe { self.blocks[p].set_len(blocks) };
+            }
+            return;
+        }
         for p in 0..self.count.len() {
             if self.count[p] != 0 {
                 let b = self.stage[p];

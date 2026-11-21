@@ -111,6 +111,9 @@ struct Ctx {
     product_fast: U64Map,
     product_slow: HashMap<Vec<u8>, u32>,
     camp_fast: U64Map,
+    /// Campaigns with IDs of at most 7 bytes: open addressing over (raw
+    /// bytes | length << 56, index); u64::MAX marks an empty slot.
+    camp_short: Vec<(u64, u32)>,
     camp_slow: HashMap<Vec<u8>, u32>,
     campaign_ids: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
@@ -133,26 +136,30 @@ impl Ctx {
         found.unwrap_or(self.unknown_cat)
     }
 
-    #[inline]
+    /// The campaign's index (`c` has 8 readable bytes).
+    #[inline(always)]
     fn campaign(&self, c: &[u8]) -> Option<u32> {
-        if c.is_empty() {
-            return None;
+        let n = c.len();
+        if n <= 7 {
+            // Every campaign this short is in `camp_short`.
+            let k = unsafe { std::arch::x86_64::_bzhi_u64((c.as_ptr() as *const u64).read_unaligned(), 8 * n as u32) } | (n as u64) << 56;
+            let mask = self.camp_short.len() - 1;
+            let mut i = (k.wrapping_mul(crate::table::PHI) >> 40) as usize & mask;
+            loop {
+                let (sk, v) = unsafe { *self.camp_short.get_unchecked(i) };
+                if sk == k {
+                    return Some(v);
+                }
+                if sk == u64::MAX {
+                    return None;
+                }
+                i = (i + 1) & mask;
+            }
         }
-        match fast::pack(c.as_ptr(), c.len()) {
+        match fast::pack(c.as_ptr(), n) {
             Some(k) => self.camp_fast.get(k).map(|v| v as u32),
             None => self.camp_slow.get(c).copied(),
         }
-    }
-
-    /// A ts value; `back16` says the 16 bytes before the value's end are readable.
-    #[inline(always)]
-    fn ts(&self, s: &[u8], back16: bool) -> Option<i64> {
-        let n = s.len();
-        if back16 && (1..=16).contains(&n) {
-            // At most 16 bytes: F3 if every byte is a digit, else bad (F1 and F2 are longer).
-            return fast::digits16(unsafe { s.as_ptr().add(n) }, n).map(|v| v as i64);
-        }
-        self.fast_ts.parse(s)
     }
 }
 
@@ -1227,6 +1234,7 @@ pub fn run() -> bool {
     let tbits = (usize::BITS - (threads.max(2) - 1).leading_zeros()).max(1);
     let per_part: usize = env("PER_PART", "49152").parse().unwrap();
     crate::scatter2::NT.store(env("SCATTER_NT", "1") == "1", Ordering::Relaxed);
+    crate::scatter2::DIRECT.store(env("SCAT", "") == "direct", Ordering::Relaxed);
     let p2_bits = bits_for(est_events, per_part, 10.min(29 - tbits));
     let ctx = Ctx {
         ws_s: ws / 1000,
@@ -1239,6 +1247,23 @@ pub fn run() -> bool {
         unknown_cat,
         product_fast,
         product_slow,
+        camp_short: {
+            let cap = (campaign_ids.len() * 4).max(16).next_power_of_two();
+            let mut t = vec![(u64::MAX, 0u32); cap];
+            for (i, id) in campaign_ids.iter().enumerate() {
+                if id.len() <= 7 {
+                    let mut b = [0u8; 8];
+                    b[..id.len()].copy_from_slice(id);
+                    let k = u64::from_le_bytes(b) | (id.len() as u64) << 56;
+                    let mut j = (k.wrapping_mul(crate::table::PHI) >> 40) as usize & (cap - 1);
+                    while t[j].0 != u64::MAX {
+                        j = (j + 1) & (cap - 1);
+                    }
+                    t[j] = (k, i as u32);
+                }
+            }
+            t
+        },
         camp_fast,
         camp_slow,
         campaign_ids,
