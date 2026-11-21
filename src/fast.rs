@@ -163,6 +163,69 @@ pub fn tokenize2<const N: usize>(data: &[u8], p: usize, f: &mut [(u32, u32); N])
     Some((next, true))
 }
 
+/// Field ranges of a tokenized line: value start and end, relative to the line.
+pub struct Fields<const N: usize> {
+    pub start: [u32; N],
+    pub end: [u32; N],
+}
+
+/// `tokenize` without data-dependent branches on the hot path: the comma
+/// positions come from a fixed count of tzcnt/blsr steps on two 64-bit
+/// halves, and which fields are quoted is one PEXT of the opening quotes at
+/// the field starts. Same results as `tokenize`.
+#[inline(always)]
+pub fn tokenize3<const N: usize>(data: &[u8], p: usize, f: &mut Fields<N>) -> Option<(usize, bool)> {
+    debug_assert!(p + LOOKAHEAD <= data.len());
+    let (cm, qm, nm) = unsafe { masks128(data.as_ptr().add(p)) };
+    if nm == 0 {
+        return None;
+    }
+    let len = nm.trailing_zeros();
+    let next = p + len as usize + 1;
+    let range = (1u128 << len) - 1;
+    let c = cm & range;
+    let (clo, chi) = (c as u64, (c >> 64) as u64);
+    let commas_ok = clo.count_ones() + chi.count_ones() == (N - 1) as u32;
+    // Comma positions, branch-free: take from the low half while it has bits.
+    let (mut lo, mut hi) = (clo, chi);
+    let mut fs = 0u32;
+    for i in 0..N - 1 {
+        let use_lo = lo != 0;
+        let t = if use_lo { lo.trailing_zeros() } else { 64 + hi.trailing_zeros() };
+        lo = if use_lo { lo & lo.wrapping_sub(1) } else { lo };
+        hi = if use_lo { hi } else { hi & hi.wrapping_sub(1) };
+        f.start[i] = fs;
+        f.end[i] = t;
+        fs = t + 1;
+    }
+    f.start[N - 1] = fs;
+    f.end[N - 1] = len;
+    let q = qm & range;
+    let (qlo, qhi) = (q as u64, (q >> 64) as u64);
+    let xlo = prefix_xor64(qlo);
+    let xhi = prefix_xor64(qhi) ^ (0u64.wrapping_sub((qlo.count_ones() & 1) as u64));
+    let x = (xlo as u128) | ((xhi as u128) << 64);
+    let open = q & x;
+    let close = q & !x;
+    let starts = ((c << 1) | 1) & range;
+    let last = 1u128 << (len.max(1) - 1);
+    let ends = (c >> 1) | last;
+    let bad = (open & !starts) | (close & !ends) | (x & c) | (x & last);
+    let ok = commas_ok && len != 0 && bad == 0;
+    // Bit i of `quoted` = field i starts with an opening quote.
+    let (slo, shi) = (starts as u64, (starts >> 64) as u64);
+    let quoted = unsafe {
+        use std::arch::x86_64::_pext_u64;
+        _pext_u64(open as u64, slo) | (_pext_u64((open >> 64) as u64, shi) << slo.count_ones())
+    };
+    for i in 0..N {
+        let qi = ((quoted >> i) & 1) as u32;
+        f.start[i] += qi;
+        f.end[i] -= qi;
+    }
+    Some((next, ok))
+}
+
 static LEN_MASKS: [[u8; 16]; 17] = {
     let mut t = [[0u8; 16]; 17];
     let mut n = 0;
@@ -287,7 +350,7 @@ mod tests {
         let mut seed = 12345u64;
         for _ in 0..200_000 {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let len = (seed >> 58) as usize;
+            let len = if seed & 1 == 0 { (seed >> 58) as usize } else { 60 + ((seed >> 57) as usize % 68) };
             let mut line = Vec::new();
             let mut s = seed;
             for _ in 0..len {
@@ -301,8 +364,14 @@ mod tests {
             let mut f2 = [(0u32, 0u32); 3];
             let (_, ok2) = tokenize2::<3>(&buf, 32, &mut f2).unwrap();
             assert_eq!(ok, ok2, "{:?}", String::from_utf8_lossy(&line));
+            let mut f3 = Fields::<3> { start: [0; 3], end: [0; 3] };
+            let (_, ok3) = tokenize3::<3>(&buf, 32, &mut f3).unwrap();
+            assert_eq!(ok, ok3, "tokenize3 {:?}", String::from_utf8_lossy(&line));
             if ok {
                 assert_eq!(f, f2);
+                for i in 0..3 {
+                    assert_eq!((f3.start[i], f3.end[i]), f[i]);
+                }
             }
             let mut g = [&b""[..]; 3];
             let want = split(&line, &mut g);

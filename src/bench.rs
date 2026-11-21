@@ -117,6 +117,22 @@ pub fn run() {
             }
             per(if both { "+ts x2" } else { "+ts x1" }, t, sink);
         }
+        if on("tok3") {
+            let t = Instant::now();
+            let mut p = start;
+            let mut sink = 0u64;
+            let mut g = fast::Fields::<7> { start: [0; 7], end: [0; 7] };
+            while p < limit {
+                match fast::tokenize3::<7>(file, p, &mut g) {
+                    Some((next, ok)) => {
+                        sink += ok as u64 + g.start[3] as u64;
+                        p = next;
+                    }
+                    None => p += memchr::memchr(b'\n', &file[p..]).unwrap() + 1,
+                }
+            }
+            per("tokenize3", t, sink);
+        }
         // 3. Scalar split for comparison.
         if on("split") {
         let t = Instant::now();

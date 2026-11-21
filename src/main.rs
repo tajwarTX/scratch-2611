@@ -8,6 +8,7 @@ mod fast;
 mod keys;
 mod legacy;
 mod out;
+mod pq;
 mod scatter;
 mod scatter2;
 mod table;

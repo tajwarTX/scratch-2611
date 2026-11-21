@@ -190,8 +190,52 @@ impl FastTs {
         FastTs { prefixes, count }
     }
 
+    /// F1 with word-at-a-time checks; None means "not handled here" (the
+    /// caller then uses `parse`, which is exact for everything).
+    #[inline(always)]
+    pub fn f1_swar(&self, s: &[u8]) -> Option<i64> {
+        if s.len() != 20 {
+            return None;
+        }
+        let key = u64::from_le_bytes(s[..8].try_into().unwrap());
+        let b = u64::from_le_bytes(s[8..16].try_into().unwrap());
+        let c = u32::from_le_bytes(s[16..20].try_into().unwrap());
+        if (b & 0x0000_FF00_00FF_0000) != 0x0000_3A00_0054_0000 || (c & 0xFF00_00FF) != 0x5A00_003A {
+            return None;
+        }
+        let d = b ^ 0x3030_0030_3000_3030;
+        if ((d.wrapping_add(0x7676_0076_7600_7676)) | d) & 0x8080_0080_8000_8080 != 0 {
+            return None;
+        }
+        let e = c ^ 0x0030_3000;
+        if ((e.wrapping_add(0x0076_7600)) | e) & 0x0080_8000 != 0 {
+            return None;
+        }
+        let byte = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as u32;
+        let dd = byte(d, 0) * 10 + byte(d, 1);
+        let hh = byte(d, 3) * 10 + byte(d, 4);
+        let mm = byte(d, 6) * 10 + byte(d, 7);
+        let ss = ((e >> 8) & 0xFF) * 10 + ((e >> 16) & 0xFF);
+        if hh > 23 || mm > 59 || ss > 59 {
+            return None;
+        }
+        for &(k, base, first, last) in &self.prefixes[..self.count] {
+            if k == key {
+                if dd < first || dd > last {
+                    return None;
+                }
+                let days = base + dd as i64 - 1;
+                return Some((days * 86_400 + hh as i64 * 3_600 + mm as i64 * 60 + ss as i64) * 1_000);
+            }
+        }
+        None
+    }
+
     #[inline(always)]
     pub fn parse(&self, s: &[u8]) -> Option<i64> {
+        if let Some(v) = self.f1_swar(s) {
+            return Some(v);
+        }
         let n = s.len();
         if n == 20 || n == 25 {
             let key = u64::from_le_bytes(s[..8].try_into().unwrap());
@@ -277,6 +321,21 @@ mod fast_tests {
             cases.push("2028-02-2a".into());
             for c in &cases {
                 assert_eq!(fast.parse(c.as_bytes()), parse_ts(c.as_bytes()), "{}", c);
+                if let Some(v) = fast.f1_swar(c.as_bytes()) {
+                    assert_eq!(Some(v), parse_ts(c.as_bytes()), "swar {}", c);
+                }
+            }
+            // Every byte position of a valid F1 replaced by every byte value.
+            let good = b"2028-02-29T12:34:56Z";
+            for i in 0..20 {
+                for v in 0..=255u8 {
+                    let mut t = *good;
+                    t[i] = v;
+                    if let Some(x) = fast.f1_swar(&t) {
+                        assert_eq!(Some(x), parse_ts(&t), "swar {:?}", String::from_utf8_lossy(&t));
+                    }
+                    assert_eq!(fast.parse(&t), parse_ts(&t));
+                }
             }
         }
     }

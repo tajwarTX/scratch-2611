@@ -25,7 +25,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use memmap2::Mmap;
-use parquet::data_type::ByteArray;
 
 use crate::csv::{for_each_record, split};
 use crate::fast;
@@ -314,15 +313,17 @@ fn for_each_line_fields<'a, const N: usize>(
     mut each: impl FnMut(&[&'a [u8]; N], bool),
 ) {
     let mut p = start;
-    let mut ranges = [(0u32, 0u32); N];
+    let mut ranges = fast::Fields::<N> { start: [0; N], end: [0; N] };
     let mut fields: [&'a [u8]; N] = [&[]; N];
     let fast_limit = file.len().saturating_sub(fast::LOOKAHEAD);
     while p < end {
         if p <= fast_limit && p >= 16 {
-            if let Some((next, ok)) = fast::tokenize2::<N>(file, p, &mut ranges) {
+            if let Some((next, ok)) = fast::tokenize3::<N>(file, p, &mut ranges) {
                 if ok {
                     for i in 0..N {
-                        fields[i] = unsafe { file.get_unchecked(p + ranges[i].0 as usize..p + ranges[i].1 as usize) };
+                        fields[i] = unsafe {
+                            file.get_unchecked(p + ranges.start[i] as usize..p + ranges.end[i] as usize)
+                        };
                     }
                     each(&fields, true);
                 }
@@ -917,6 +918,7 @@ pub fn run() -> bool {
 }
 
 fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
+    use crate::pq::{write, Col, Column};
     let user_dir = out_dir.join("user_daily");
     let camp_dir = out_dir.join("campaign_daily");
     std::fs::create_dir_all(&user_dir).expect("user_daily dir");
@@ -935,51 +937,43 @@ fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
             let path = user_dir.join(format!("part-{:05}.parquet", t));
             sc.spawn(move || {
                 let rows = &s.rows;
-                // Every user_id in one buffer; the writer gets cheap slices of it.
-                let mut text = Vec::with_capacity(rows.len() * 10);
-                let mut ends = Vec::with_capacity(rows.len());
+                let mut ids = Vec::with_capacity(rows.len() * 10);
+                let mut id_ends = Vec::with_capacity(rows.len());
+                let mut cats = Vec::new();
+                let mut cat_ends = Vec::new();
+                let mut present = Vec::with_capacity(rows.len());
                 for r in rows {
-                    key_bytes(r.person, &mut text);
-                    ends.push(text.len());
+                    key_bytes(r.person, &mut ids);
+                    id_ends.push(ids.len() as u32);
+                    present.push(r.top != u32::MAX);
+                    if r.top != u32::MAX {
+                        cats.extend_from_slice(&ctx.categories[r.top as usize]);
+                        cat_ends.push(cats.len() as u32);
+                    }
                 }
-                let text = bytes::Bytes::from(text);
-                let mut from = 0;
-                let user_id: Vec<ByteArray> = ends
-                    .iter()
-                    .map(|&to| {
-                        let b = ByteArray::from(text.slice(from..to));
-                        from = to;
-                        b
-                    })
-                    .collect();
-                let cat_names: Vec<ByteArray> = ctx.categories.iter().map(|c| ByteArray::from(c.clone())).collect();
-                let cols = crate::out::UserOut {
-                    user_id: &user_id,
-                    day: &rows.iter().map(|r| r.day).collect::<Vec<_>>(),
-                    sessions: &rows.iter().map(|r| r.sessions as i64).collect::<Vec<_>>(),
-                    events: &rows.iter().map(|r| r.events as i64).collect::<Vec<_>>(),
-                    revenue: &rows.iter().map(|r| r.revenue as i64).collect::<Vec<_>>(),
-                    top_def: &rows.iter().map(|r| (r.top != u32::MAX) as i16).collect::<Vec<_>>(),
-                    top: &rows
-                        .iter()
-                        .filter(|r| r.top != u32::MAX)
-                        .map(|r| cat_names[r.top as usize].clone())
-                        .collect::<Vec<_>>(),
-                };
-                crate::out::write_user_daily(&path, &cols).expect("write user_daily");
+                let day: Vec<i32> = rows.iter().map(|r| r.day).collect();
+                let sessions: Vec<i64> = rows.iter().map(|r| r.sessions as i64).collect();
+                let events: Vec<i64> = rows.iter().map(|r| r.events as i64).collect();
+                let revenue: Vec<i64> = rows.iter().map(|r| r.revenue as i64).collect();
+                write(
+                    &path,
+                    &[
+                        Column { name: "user_id", data: Col::Str { bytes: &ids, ends: &id_ends } },
+                        Column { name: "day", data: Col::Date(&day) },
+                        Column { name: "sessions", data: Col::I64(&sessions) },
+                        Column { name: "events", data: Col::I64(&events) },
+                        Column { name: "revenue_cents", data: Col::I64(&revenue) },
+                        Column { name: "top_category", data: Col::OptStr { present: &present, bytes: &cats, ends: &cat_ends } },
+                    ],
+                )
+                .expect("write user_daily");
             });
         }
         let acc = &acc;
         sc.spawn(move || {
-            let mut c = crate::out::CampaignOut {
-                campaign_id: Vec::new(),
-                channel: Vec::new(),
-                day: Vec::new(),
-                sessions: Vec::new(),
-                purchasing: Vec::new(),
-                revenue: Vec::new(),
-                assisted: Vec::new(),
-            };
+            let (mut ids, mut id_ends, mut chans, mut chan_ends) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut day, mut sessions, mut purchasing, mut revenue, mut assisted) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for camp in 0..=ncamp {
                 for d in 0..ndays {
                     let a = acc[camp * ndays + d];
@@ -991,16 +985,30 @@ fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
                     } else {
                         (&ctx.campaign_ids[camp], &ctx.channels[camp])
                     };
-                    c.campaign_id.push(ByteArray::from(id.to_vec()));
-                    c.channel.push(ByteArray::from(channel.to_vec()));
-                    c.day.push((ctx.day_lo + d as i64) as i32);
-                    c.sessions.push(a[0] as i64);
-                    c.purchasing.push(a[1] as i64);
-                    c.revenue.push(a[2] as i64);
-                    c.assisted.push(if camp == ncamp { 0 } else { a[3] as i64 });
+                    ids.extend_from_slice(id);
+                    id_ends.push(ids.len() as u32);
+                    chans.extend_from_slice(channel);
+                    chan_ends.push(chans.len() as u32);
+                    day.push((ctx.day_lo + d as i64) as i32);
+                    sessions.push(a[0] as i64);
+                    purchasing.push(a[1] as i64);
+                    revenue.push(a[2] as i64);
+                    assisted.push(if camp == ncamp { 0 } else { a[3] as i64 });
                 }
             }
-            crate::out::write_campaign_daily(&camp_dir.join("part-00000.parquet"), &c).expect("write campaign_daily");
+            write(
+                &camp_dir.join("part-00000.parquet"),
+                &[
+                    Column { name: "campaign_id", data: Col::Str { bytes: &ids, ends: &id_ends } },
+                    Column { name: "channel", data: Col::Str { bytes: &chans, ends: &chan_ends } },
+                    Column { name: "day", data: Col::Date(&day) },
+                    Column { name: "sessions", data: Col::I64(&sessions) },
+                    Column { name: "purchasing_sessions", data: Col::I64(&purchasing) },
+                    Column { name: "revenue_cents", data: Col::I64(&revenue) },
+                    Column { name: "assisted_sessions", data: Col::I64(&assisted) },
+                ],
+            )
+            .expect("write campaign_daily");
         });
     });
 }
