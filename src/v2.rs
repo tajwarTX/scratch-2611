@@ -541,9 +541,21 @@ fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p2: u32, ib: u32, st: 
 
 // ---------------------------------------------------------------- sessions
 
+/// A click in its person's group: id, ts, campaign.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Ck {
+    id: u64,
+    ts: u32,
+    camp: u32,
+}
+
 struct CState {
-    evs: Vec<PEv>,
-    cks: Vec<PCk>,
+    /// Events grouped by person as 8-byte sort keys: ts << 32 | pc.
+    evs: Vec<u64>,
+    cks: Vec<Ck>,
+    ev_tmp: Vec<u64>,
+    ck_tmp: Vec<Ck>,
     pmap: LocalMap,
     rmap: LocalMap,
     roots: Vec<u64>,
@@ -558,6 +570,8 @@ struct CState {
     win: Vec<u32>,
     active: Vec<u32>,
     pos: Vec<u32>,
+    act: Vec<[u32; 2]>,
+    segs: Vec<(u32, u32)>,
     cats: Vec<(u32, u64)>,
 }
 
@@ -568,23 +582,110 @@ struct Walk<'a> {
     win: &'a mut Vec<u32>,
     active: &'a mut Vec<u32>,
     pos: &'a mut Vec<u32>,
+    act: &'a mut Vec<[u32; 2]>,
+    segs: &'a mut Vec<(u32, u32)>,
     cats: &'a mut Vec<(u32, u64)>,
 }
 
-/// One person's events (sorted by ts) and clicks (sorted by ts, then
-/// click_id descending): sessions, credit, assists, daily rows.
-fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk) {
-    let _ = ctx.ndays;
+/// Credits campaign `c` an assist for each of the person's sessions in
+/// [act[c][0], b): per day, from the day segments `segs` (day index, first
+/// session), starting at segment act[c][1].
+#[inline(always)]
+fn close_assist(asst: &mut [u64], segs: &[(u32, u32)], act: [u32; 2], b: u32, c: usize, nc: usize) {
+    let a = act[0];
+    if a >= b {
+        return;
+    }
+    let mut g = act[1] as usize;
+    loop {
+        let (di, first) = unsafe { *segs.get_unchecked(g) };
+        let end = if g + 1 < segs.len() { unsafe { segs.get_unchecked(g + 1).1 }.min(b) } else { b };
+        let from = a.max(first);
+        if end > from {
+            unsafe { *asst.get_unchecked_mut(di as usize * nc + c) += (end - from) as u64 };
+        }
+        if end >= b {
+            return;
+        }
+        g += 1;
+    }
+}
+
+/// Below this many records a comparison sort beats the radix sort.
+const RADIX_MIN: usize = 384;
+
+/// Sorts `v` by a 32-bit key: LSD radix, three 11-bit digits, skipping
+/// digits every record shares. `tmp` is scratch.
+fn radix_sort<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32) {
+    const B: u32 = 11;
+    const R: usize = 1 << B;
+    let n = v.len();
+    if n < 2 {
+        return;
+    }
+    let mut h = vec![[0u32; R]; 3];
+    for x in v.iter() {
+        let k = key(x);
+        h[0][(k & (R as u32 - 1)) as usize] += 1;
+        h[1][((k >> B) & (R as u32 - 1)) as usize] += 1;
+        h[2][(k >> (2 * B)) as usize] += 1;
+    }
+    if tmp.len() < n {
+        tmp.resize(n, v[0]);
+    }
+    let mut in_v = true;
+    for (d, hd) in h.iter_mut().enumerate() {
+        if hd.iter().any(|&c| c as usize == n) {
+            continue;
+        }
+        let shift = d as u32 * B;
+        let mut sum = 0u32;
+        for c in hd.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+        // v and tmp are distinct buffers: source and destination never alias.
+        let (src, dst) = unsafe {
+            if in_v {
+                (std::slice::from_raw_parts(v.as_ptr(), n), std::slice::from_raw_parts_mut(tmp.as_mut_ptr(), n))
+            } else {
+                (std::slice::from_raw_parts(tmp.as_ptr(), n), std::slice::from_raw_parts_mut(v.as_mut_ptr(), n))
+            }
+        };
+        for x in src {
+            let b = ((key(x) >> shift) as usize) & (R - 1);
+            unsafe {
+                let p = hd.get_unchecked_mut(b);
+                *dst.get_unchecked_mut(*p as usize) = *x;
+                *p += 1;
+            }
+        }
+        in_v = !in_v;
+    }
+    if !in_v {
+        v.copy_from_slice(&tmp[..n]);
+    }
+}
+
+/// One person's events (8-byte keys ts << 32 | pc, sorted) and clicks
+/// (sorted by ts; ties in any order): sessions, credit, assists, daily rows.
+fn process_person(person: u64, evs: &[u64], cks: &[Ck], ctx: &Ctx, w: &mut Walk) {
     let organic = ctx.campaign_ids.len();
+    let nc = organic + 1;
     let reach = REACH as u32;
     let (mut lo, mut hi) = (0usize, 0usize);
     let n = evs.len();
     let mut k = 0usize;
     let mut cur_day = i64::MIN;
     let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0u64);
+    // Session count so far; assists are credited per interval of sessions a
+    // campaign stays in the window (see close_assist).
+    let mut ns = 0u32;
     w.cats.clear();
+    w.segs.clear();
     while k < n {
-        let start = evs[k].ts;
+        let start = (evs[k] >> 32) as u32;
         let day = (ctx.base + start as i64).div_euclid(DAY);
         if day != cur_day {
             if cur_day != i64::MIN {
@@ -598,6 +699,7 @@ fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk
                 });
             }
             cur_day = day;
+            w.segs.push(((day - ctx.day_lo) as u32, ns));
             d_sessions = 0;
             d_events = 0;
             d_revenue = 0;
@@ -607,14 +709,19 @@ fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk
         let mut last = start;
         let mut s_revenue = 0u64;
         let mut s_purchase = false;
-        while m < n && evs[m].ts - last <= GAP {
-            let e = &evs[m];
-            last = e.ts;
-            if e.pc != 0 {
-                let price = e.pc & 0x00FF_FFFF;
+        while m < n {
+            let e = unsafe { *evs.get_unchecked(m) };
+            let ts = (e >> 32) as u32;
+            if ts - last > GAP {
+                break;
+            }
+            last = ts;
+            let pc = e as u32;
+            if pc != 0 {
+                let price = pc & 0x00FF_FFFF;
                 s_revenue += price as u64;
                 s_purchase = true;
-                add_cat(w.cats, e.pc >> 24, price);
+                add_cat(w.cats, pc >> 24, price);
             }
             m += 1;
         }
@@ -630,6 +737,7 @@ fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk
             if w.win[c] == 0 {
                 w.pos[c] = w.active.len() as u32;
                 w.active.push(c as u32);
+                w.act[c] = [ns, w.segs.len() as u32 - 1];
             }
             w.win[c] += 1;
             hi += 1;
@@ -638,6 +746,7 @@ fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk
             let c = cks[lo].camp as usize;
             w.win[c] -= 1;
             if w.win[c] == 0 {
+                close_assist(w.asst, w.segs, w.act[c], ns, c, nc);
                 let at = w.pos[c] as usize;
                 let moved = *w.active.last().unwrap();
                 w.active.swap_remove(at);
@@ -648,16 +757,26 @@ fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk
             lo += 1;
         }
         let di = (day - ctx.day_lo) as usize;
-        let camp = if lo < hi { cks[hi - 1].camp as usize } else { organic };
-        let nc = organic + 1;
+        let camp = if lo < hi {
+            // The latest click; on a ts tie, the smallest click_id.
+            let mut b = hi - 1;
+            let t = cks[b].ts;
+            let mut i = b;
+            while i > lo && cks[i - 1].ts == t {
+                i -= 1;
+                if cmp_key(cks[i].id, cks[b].id) == std::cmp::Ordering::Less {
+                    b = i;
+                }
+            }
+            cks[b].camp as usize
+        } else {
+            organic
+        };
         let a = &mut w.acc[di * nc + camp];
         a[0] += 1;
         a[1] += s_purchase as u64;
         a[2] += s_revenue;
-        let row = &mut w.asst[di * nc..(di + 1) * nc];
-        for &c in w.active.iter() {
-            row[c as usize] += 1;
-        }
+        ns += 1;
         k = m;
     }
     if cur_day != i64::MIN {
@@ -671,6 +790,7 @@ fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk
         });
     }
     for &c in w.active.iter() {
+        close_assist(w.asst, w.segs, w.act[c as usize], ns, c as usize, nc);
         w.win[c as usize] = 0;
     }
     w.active.clear();
@@ -732,13 +852,13 @@ fn redirect_partition(ms: &mut MState, a: &[AState], rd: &[Scatter16<Rd>], u: us
     }
 }
 
-/// Every event of partition `j`, in a fixed order: own rows not tombstoned
-/// or redirected away, then rows redirected here.
+/// Every event row of partition `j`, in a fixed order: own rows not
+/// tombstoned (rows of redirected IDs included), then rows redirected here.
 #[inline(always)]
-fn each_ev(srcs: &[AState], ms: &[MState], j: usize, own: &impl Fn(u64) -> bool, mut f: impl FnMut(&PEv)) {
+fn each_ev(srcs: &[AState], ms: &[MState], j: usize, mut f: impl FnMut(&PEv)) {
     for s in srcs {
         for e in s.pe.records(j) {
-            if e.ts != TOMB && own(e.person) {
+            if e.ts != TOMB {
                 f(e);
             }
         }
@@ -751,12 +871,10 @@ fn each_ev(srcs: &[AState], ms: &[MState], j: usize, own: &impl Fn(u64) -> bool,
 }
 
 #[inline(always)]
-fn each_ck(srcs: &[AState], ms: &[MState], j: usize, own: &impl Fn(u64) -> bool, mut f: impl FnMut(&PCk)) {
+fn each_ck(srcs: &[AState], ms: &[MState], j: usize, mut f: impl FnMut(&PCk)) {
     for s in srcs {
         for c in &s.pc.parts[j] {
-            if own(c.person) {
-                f(c);
-            }
+            f(c);
         }
     }
     for m in ms {
@@ -766,72 +884,142 @@ fn each_ck(srcs: &[AState], ms: &[MState], j: usize, own: &impl Fn(u64) -> bool,
     }
 }
 
+/// Group marker: an ID whose rows phase C moved to its person.
+const DEAD: u32 = u32::MAX;
+
+/// Turns per-group counts into group starts (`starts`, one extra at the end)
+/// and leaves each live group's write cursor at its start.
+fn starts_of(cursor: &mut [u32], starts: &mut Vec<u32>) -> usize {
+    starts.clear();
+    let mut total = 0u32;
+    for c in cursor.iter_mut() {
+        starts.push(total);
+        if *c != DEAD {
+            let n = *c;
+            *c = total;
+            total += n;
+        }
+    }
+    starts.push(total);
+    total as usize
+}
+
+/// D: one person partition. Rows are grouped by ID with a counting sort on a
+/// local index; an ID whose rows phase C moved to its person (a redirected
+/// ID) is looked up once per ID, not per row, and its group stays empty.
 #[inline(never)]
 fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scatter16<Rd>], j: usize, ctx: &Ctx) {
-    let interned = any_interned();
-    let CState { evs, cks, pmap, rmap, roots, persons, local, ev_start, ck_start, cursor, rows, acc, asst, win, active, pos, cats } = st;
+    let CState {
+        evs,
+        cks,
+        ev_tmp,
+        ck_tmp,
+        pmap,
+        rmap,
+        roots,
+        persons,
+        local,
+        ev_start,
+        ck_start,
+        cursor,
+        rows,
+        acc,
+        asst,
+        win,
+        active,
+        pos,
+        act,
+        segs,
+        cats,
+    } = st;
     let any_rd = load_redirects(rd, j, rmap, roots);
-    let rmap = &*rmap;
-    let own = |k: u64| !any_rd || rmap.get(k).is_none();
     let n: usize = srcs.iter().map(|s| s.pe.len(j)).sum::<usize>() + ms.iter().map(|m| m.mv.len(j)).sum::<usize>();
-    pmap.reset(n / 8 + 16);
+    pmap.reset(n / 16 + 64);
     persons.clear();
     local.clear();
+    local.reserve(n);
     cursor.clear();
-    each_ev(srcs, ms, j, &own, |e| {
+    each_ev(srcs, ms, j, |e| {
         let (idx, inserted) = pmap.get_or_insert(e.person, persons.len() as u32);
         if inserted {
             persons.push(e.person);
             cursor.push(0);
         }
-        cursor[idx as usize] += 1;
-        local.push(idx);
+        unsafe {
+            *cursor.get_unchecked_mut(idx as usize) += 1;
+            let l = local.len();
+            *local.as_mut_ptr().add(l) = idx;
+            local.set_len(l + 1);
+        }
     });
     let np = persons.len();
-    prefix(cursor, ev_start);
-    cursor.copy_from_slice(&ev_start[..np]);
-    evs.clear();
-    evs.resize(ev_start[np] as usize, PEv::default());
-    let mut k = 0usize;
-    each_ev(srcs, ms, j, &own, |e| {
-        let idx = local[k] as usize;
-        k += 1;
-        let pos = cursor[idx] as usize;
-        cursor[idx] += 1;
-        evs[pos] = *e;
-    });
-    local.clear();
-    cursor.iter_mut().for_each(|c| *c = 0);
-    each_ck(srcs, ms, j, &own, |c| {
-        let idx = pmap.get(c.person).unwrap_or(NONE);
-        if idx != NONE {
-            cursor[idx as usize] += 1;
+    if any_rd {
+        for p in 0..np {
+            if rmap.get(persons[p]).is_some() {
+                cursor[p] = DEAD;
+            }
         }
+    }
+    let total = starts_of(cursor, ev_start);
+    evs.clear();
+    evs.reserve(total);
+    unsafe { evs.set_len(total) };
+    let mut k = 0usize;
+    each_ev(srcs, ms, j, |e| unsafe {
+        let c = cursor.get_unchecked_mut(*local.get_unchecked(k) as usize);
+        k += 1;
+        if *c != DEAD {
+            *evs.get_unchecked_mut(*c as usize) = (e.ts as u64) << 32 | e.pc as u64;
+            *c += 1;
+        }
+    });
+    // Clicks: only those of live IDs with events here.
+    local.clear();
+    for c in cursor.iter_mut() {
+        if *c != DEAD {
+            *c = 0;
+        }
+    }
+    each_ck(srcs, ms, j, |c| {
+        let idx = match pmap.get(c.person) {
+            Some(i) if cursor[i as usize] != DEAD => {
+                cursor[i as usize] += 1;
+                i
+            }
+            _ => NONE,
+        };
         local.push(idx);
     });
-    prefix(cursor, ck_start);
-    cursor.copy_from_slice(&ck_start[..np]);
+    let total = starts_of(cursor, ck_start);
     cks.clear();
-    cks.resize(ck_start[np] as usize, PCk::default());
+    cks.resize(total, Ck::default());
     let mut k = 0usize;
-    each_ck(srcs, ms, j, &own, |c| {
-        let idx = local[k];
+    each_ck(srcs, ms, j, |c| unsafe {
+        let idx = *local.get_unchecked(k);
         k += 1;
         if idx != NONE {
-            let pos = cursor[idx as usize] as usize;
-            cursor[idx as usize] += 1;
-            cks[pos] = *c;
+            let p = cursor.get_unchecked_mut(idx as usize);
+            *cks.get_unchecked_mut(*p as usize) = Ck { id: c.id, ts: c.ts, camp: c.camp };
+            *p += 1;
         }
     });
-    let mut w = Walk { rows, acc, asst, win, active, pos, cats };
+    let mut w = Walk { rows, acc, asst, win, active, pos, act, segs, cats };
     for p in 0..np {
-        let pe = &mut evs[ev_start[p] as usize..ev_start[p + 1] as usize];
-        pe.sort_unstable_by_key(|e| e.ts);
-        let pc = &mut cks[ck_start[p] as usize..ck_start[p + 1] as usize];
-        if interned {
-            pc.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then(cmp_key(b.id, a.id)));
+        let (es, ee) = (ev_start[p] as usize, ev_start[p + 1] as usize);
+        if es == ee {
+            continue;
+        }
+        let pe = &mut evs[es..ee];
+        if pe.len() < RADIX_MIN {
+            pe.sort_unstable();
         } else {
-            pc.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then(b.id.cmp(&a.id)));
+            radix_sort(pe, ev_tmp, |&e| (e >> 32) as u32);
+        }
+        let pc = &mut cks[ck_start[p] as usize..ck_start[p + 1] as usize];
+        if pc.len() < RADIX_MIN {
+            pc.sort_unstable_by_key(|c| c.ts);
+        } else {
+            radix_sort(pc, ck_tmp, |c| c.ts);
         }
         process_person(persons[p], pe, pc, ctx, &mut w);
     }
@@ -1089,6 +1277,8 @@ pub fn run() -> bool {
         .map(|_| CState {
             evs: Vec::new(),
             cks: Vec::new(),
+            ev_tmp: Vec::new(),
+            ck_tmp: Vec::new(),
             pmap: LocalMap::new(),
             rmap: LocalMap::new(),
             roots: Vec::new(),
@@ -1103,6 +1293,8 @@ pub fn run() -> bool {
             win: vec![0u32; ncamp + 1],
             active: Vec::new(),
             pos: vec![0u32; ncamp + 1],
+            act: vec![[0u32; 2]; ncamp + 1],
+            segs: Vec::new(),
             cats: Vec::new(),
         })
         .collect();
