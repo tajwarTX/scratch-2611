@@ -1268,17 +1268,25 @@ pub fn run() -> bool {
     }
     let per_pe = est_events / (threads * p2) * 5 / 4 + 64;
     let per_dd = est_events / (threads * p1) * 5 / 4 + 64;
-    let mut a_states: Vec<AState> = (0..threads)
-        .map(|t| AState {
-            tid: t as u32,
-            pe: Scatter16::new(p2, per_pe),
-            dd: Scatter16::new(p1, per_dd),
-            pc: Scatter::new(p2, per_pe / 4),
-            sc: Scanner::new(),
-            buf: Vec::new(),
-            bad: false,
+    // PALLOC=1 (experiment): each thread allocates its own buffers, so the
+    // zeroing of their fresh huge pages is spread over all cores.
+    let make = |t: usize| AState {
+        tid: t as u32,
+        pe: Scatter16::new(p2, per_pe),
+        dd: Scatter16::new(p1, per_dd),
+        pc: Scatter::new(p2, per_pe / 4),
+        sc: Scanner::new(),
+        buf: Vec::new(),
+        bad: false,
+    };
+    let mut a_states: Vec<AState> = if env("PALLOC", "0") == "1" {
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads).map(|t| sc.spawn(move || make(t))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
         })
-        .collect();
+    } else {
+        (0..threads).map(make).collect()
+    };
     let readio = env("READIO", "0") == "1";
     let open = |dir: &str| -> Vec<std::fs::File> {
         list_csv(&data.join(dir)).iter().map(|p| std::fs::File::open(p).expect("open")).collect()
