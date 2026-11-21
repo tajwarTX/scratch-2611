@@ -45,8 +45,18 @@ const RING: usize = 16;
 
 macro_rules! log {
     ($t0:expr, $($arg:tt)*) => {
-        eprintln!("[{:>7.3}s] {}", $t0.elapsed().as_secs_f64(), format!($($arg)*))
+        eprintln!("[{:>7.3}s] {} (rss {} MB, anon {} MB)", $t0.elapsed().as_secs_f64(), format!($($arg)*), rss_mb().0, rss_mb().1)
     };
+}
+
+/// Resident and anonymous-resident memory in MB (from /proc/self/statm; 0 if unavailable).
+fn rss_mb() -> (u64, u64) {
+    let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    let v: Vec<u64> = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+    if v.len() < 3 {
+        return (0, 0);
+    }
+    (v[1] * 4096 >> 20, (v[1] - v[2]) * 4096 >> 20)
 }
 
 /// A valid event, in its person's partition. `ts` is ms since `base`
