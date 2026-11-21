@@ -1,0 +1,7 @@
+/kit/
+/target/
+/out/
+/dev/
+/data/
+*.parquet
+.DS_Store
