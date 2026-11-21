@@ -240,45 +240,28 @@ static LEN_MASKS: [[u8; 16]; 17] = {
     t
 };
 
-/// `keys::pack` with SSE: 16 bytes at `p` are readable; the string is the first `len`.
+/// `keys::pack` with one PEXT: 16 bytes at `p` are readable; the string is the first `len`.
 #[inline(always)]
 pub fn pack(p: *const u8, len: usize) -> Option<u64> {
+    if len > 9 {
+        return None;
+    }
     if len == 0 {
         return Some(0);
     }
-    if len > 10 {
-        return None;
-    }
     unsafe {
-        let v = _mm_loadu_si128(p as *const __m128i);
-        let gt = |k: i8| _mm_cmpgt_epi8(v, _mm_set1_epi8(k));
-        let lt = |k: i8| _mm_cmplt_epi8(v, _mm_set1_epi8(k));
-        let digit = _mm_and_si128(gt(0x2F), lt(0x3A));
-        let upper = _mm_and_si128(gt(0x40), lt(0x5B));
-        let lower = _mm_and_si128(gt(0x60), lt(0x7B));
-        let under = _mm_cmpeq_epi8(v, _mm_set1_epi8(0x5F));
-        let any = _mm_or_si128(_mm_or_si128(digit, upper), _mm_or_si128(lower, under));
-        let want = (1u32 << len) - 1;
-        if (_mm_movemask_epi8(any) as u32) & want != want {
+        let w = (p as *const u64).read_unaligned();
+        let n8 = len.min(8);
+        let mask = u64::MAX >> (64 - 8 * n8);
+        let v = w & mask;
+        let c = if len == 9 { *p.add(8) as u64 } else { 1 };
+        let t = v | (!mask & 0x0101_0101_0101_0101);
+        let bad = ((t | t.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080) != 0;
+        if bad || c == 0 || c >= 0x80 {
             return None;
         }
-        let code = _mm_or_si128(
-            _mm_or_si128(
-                _mm_and_si128(digit, _mm_sub_epi8(v, _mm_set1_epi8(0x2F))),
-                _mm_and_si128(upper, _mm_sub_epi8(v, _mm_set1_epi8(0x36))),
-            ),
-            _mm_or_si128(
-                _mm_and_si128(lower, _mm_sub_epi8(v, _mm_set1_epi8(0x3B))),
-                _mm_and_si128(under, _mm_set1_epi8(37)),
-            ),
-        );
-        let code = _mm_and_si128(code, _mm_loadu_si128(LEN_MASKS[len].as_ptr() as *const __m128i));
-        let pairs = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
-        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_1000));
-        let l0 = _mm_cvtsi128_si32(quads) as u32 as u64;
-        let l1 = _mm_extract_epi32(quads, 1) as u32 as u64;
-        let l2 = _mm_extract_epi32(quads, 2) as u32 as u64;
-        Some((l0 << 36) | (l1 << 12) | (l2 >> 12))
+        let packed = _pext_u64(v.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F);
+        Some((packed << 7) | if len == 9 { c } else { 0 })
     }
 }
 
@@ -393,6 +376,33 @@ mod tests {
         for w in words {
             let buf = padded(w);
             assert_eq!(pack(buf[32..].as_ptr(), w.len()), keys::pack(w), "{:?}", w);
+        }
+        let alphabet = [0u8, 1, b'a', b'z', b'0', b'9', b'A', b' ', 0x7f, 0x80, 0xff, b'\r', b'_'];
+        let mut r = 99u64;
+        for _ in 0..200000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            let n = (r % 12) as usize;
+            let w: Vec<u8> = (0..n).map(|i| alphabet[((r >> (5 + 4 * i)) % 13) as usize]).collect();
+            let mut buf = vec![0xAAu8; 64];
+            buf[32..32 + n].copy_from_slice(&w);
+            buf[32 + n] = alphabet[(r % 13) as usize];
+            assert_eq!(pack(buf[32..].as_ptr(), n), keys::pack(&w), "{:?}", w);
+        }
+        // Packed order is byte order.
+        let mut words: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..3000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            let n = (r % 10) as usize;
+            words.push((0..n).map(|i| [1u8, b'a', b'b', 0x7f, b'0'][((r >> (5 + 3 * i)) % 5) as usize]).collect());
+        }
+        for a in &words[..300] {
+            for b in &words {
+                assert_eq!(keys::pack(a).unwrap().cmp(&keys::pack(b).unwrap()), a.cmp(b));
+            }
         }
     }
 

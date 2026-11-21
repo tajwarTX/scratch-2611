@@ -12,6 +12,7 @@ mod pq;
 mod scatter;
 mod scatter2;
 mod table;
+mod tok;
 mod ts;
 mod v2;
 

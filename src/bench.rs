@@ -8,6 +8,9 @@ use crate::fast;
 use crate::legacy::{list_csv, map_file};
 
 pub fn run() {
+    if std::env::var("BENCH").unwrap_or_default().starts_with("mt") {
+        return mt();
+    }
     let data = std::path::PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let maps: Vec<_> = list_csv(&data.join("events")).iter().filter_map(|p| map_file(p)).collect();
     // The largest file only, so the run is a few seconds.
@@ -117,6 +120,15 @@ pub fn run() {
             }
             per(if both { "+ts x2" } else { "+ts x1" }, t, sink);
         }
+        if on("scan") {
+            let t = Instant::now();
+            let mut sink = 0u64;
+            let mut sc = crate::tok::Scanner::new();
+            crate::tok::scan_file::<7>(&mut sc, file, start, file.len(), |_, a, b| {
+                sink += (a[3] ^ b[5] ^ a[0] ^ b[6]) as u64;
+            });
+            per("scan", t, sink);
+        }
         if on("tok3") {
             let t = Instant::now();
             let mut p = start;
@@ -144,4 +156,64 @@ pub fn run() {
         per("scalar split", t, sink);
         }
     }
+}
+
+/// Multithreaded floors over all event and click files (BENCH=mt-touch, mt-sum, mt-tok3).
+fn mt() {
+    use crate::legacy::{chunks, run_jobs, Job};
+    let mode = std::env::var("BENCH").unwrap();
+    let data = std::path::PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
+    let threads: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let t0 = Instant::now();
+    let mut maps: Vec<Option<memmap2::Mmap>> = list_csv(&data.join("events")).iter().map(|p| map_file(p)).collect();
+    maps.extend(list_csv(&data.join("clicks")).iter().map(|p| map_file(p)));
+    let mut jobs = Vec::new();
+    chunks(&maps, Job::Events, &mut jobs);
+    let t1 = Instant::now();
+    let mut sinks: Vec<(u64, crate::tok::Scanner)> = (0..threads).map(|_| (0u64, crate::tok::Scanner::new())).collect();
+    run_jobs(&mut sinks, jobs.len(), |(sink, sc), j| {
+        let Job::Events(fi, s, e) = jobs[j] else { return };
+        let file: &[u8] = maps[fi].as_ref().unwrap();
+        match mode.as_str() {
+            "mt-touch" => {
+                let mut i = s;
+                while i < e {
+                    *sink += file[i] as u64;
+                    i += 4096;
+                }
+            }
+            "mt-sum" => {
+                unsafe {
+                    use std::arch::x86_64::*;
+                    let mut acc = _mm256_setzero_si256();
+                    let mut i = s;
+                    while i + 32 <= e {
+                        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_loadu_si256(file.as_ptr().add(i) as *const __m256i), _mm256_setzero_si256()));
+                        i += 32;
+                    }
+                    *sink += _mm256_extract_epi64(acc, 0) as u64;
+                }
+            }
+            "mt-scan" => {
+                crate::tok::scan_file::<7>(sc, file, s, e, |_, st, en| {
+                    *sink += (st[3] ^ en[1]) as u64;
+                });
+            }
+            _ => {
+                let limit = file.len().saturating_sub(fast::LOOKAHEAD);
+                let mut g = fast::Fields::<7> { start: [0; 7], end: [0; 7] };
+                let mut p = s;
+                while p < e && p < limit {
+                    match fast::tokenize3::<7>(file, p, &mut g) {
+                        Some((next, ok)) => {
+                            *sink += ok as u64 + g.start[3] as u64;
+                            p = next;
+                        }
+                        None => p += memchr::memchr(b'\n', &file[p..]).unwrap() + 1,
+                    }
+                }
+            }
+        }
+    });
+    eprintln!("{} map {:.3}s run {:.3}s sink {}", mode, (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64(), sinks.iter().map(|x| x.0).sum::<u64>() % 7);
 }
