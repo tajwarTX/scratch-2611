@@ -2,13 +2,18 @@
 //! at a time, and separator positions are flattened into a small index the
 //! line loop reads. Same results as `csv::split` on every line.
 //!
-//! Stage 1 (per 64-byte block): masks of `,` `"` `\n`; X = quote parity
-//! (prefix-xor, 1 from an opening quote up to its closing quote); a line is
-//! bad if an opening quote is not at a field start, a closing quote is not
-//! followed by a separator, or a separator is inside quotes. Bad bits are
-//! carried to the line's newline with one add (a carry runs through the
-//! non-newline bits up to the next newline), so each newline entry says
-//! whether its line is bad.
+//! Stage 1 (per 64-byte block): masks of `,` `"` `\n`; S = separators. A
+//! line is well formed only if every quote is either the first or the last
+//! byte of its field (exactly one of: separator before it, separator after
+//! it), and every field has an opening quote iff it has a closing one. The
+//! first test is `Qs & !(S ^ S2)`, where Qs marks the byte after each quote
+//! and S2 is S shifted by two bytes. For the second, opening quotes are
+//! added to !S so each carry lands on the separator ending its field; those
+//! landings must be exactly the separators preceded by a quote. No prefix
+//! xor, so an unclosed quote needs no per-line reset. Bad bits are carried to
+//! the line's newline with one more add (a carry runs through the
+//! non-newline bits up to the next newline); the newline entries of bad
+//! lines (rare) are flagged off the hot path.
 //!
 //! Stage 2 (per line): a line is well formed iff it is not bad and its N-th
 //! separator is its newline.
@@ -31,29 +36,6 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
         m(a, b'"') | (m(b, b'"') << 32),
         m(a, b'\n') | (m(b, b'\n') << 32),
     )
-}
-
-#[inline(always)]
-fn prefix_xor(x: u64) -> u64 {
-    unsafe {
-        let v = _mm_clmulepi64_si128(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1), 0);
-        _mm_cvtsi128_si64(v) as u64
-    }
-}
-
-/// Quote parity with a reset after every newline (the rare case of an
-/// unclosed quote): bit i = inside quotes at byte i. Returns (X, parity out).
-#[cold]
-fn parity_slow(q: u64, n: u64, mut par: u64) -> (u64, u64) {
-    let mut x = 0u64;
-    for i in 0..64 {
-        par ^= (q >> i) & 1;
-        x |= par << i;
-        if (n >> i) & 1 != 0 {
-            par = 0;
-        }
-    }
-    (x, par)
 }
 
 pub struct Scanner {
@@ -80,7 +62,8 @@ impl Scanner {
             let lim = (pos + BATCH).min(e);
             // ---- stage 1 over [pos, lim)
             let (mut wi, mut wn) = (0usize, 0usize);
-            let (mut cx, mut ps, mut cl, mut carry) = (0u64, 1u64, 0u64, false);
+            // Byte pos - 1 is a line end (a separator); no quote, no carries.
+            let (mut ps, mut pq, mut cl, mut cb) = (1u64 << 63, 0u64, 0u8, 0u8);
             let mut b = pos;
             while b < lim {
                 let (mut c, mut q, mut n) = masks(data.add(b));
@@ -91,27 +74,21 @@ impl Scanner {
                     n &= keep;
                 }
                 let sep = c | n;
-                let mut x = prefix_xor(q) ^ cx;
-                if x & n != 0 {
-                    let (xs, par) = parity_slow(q, n, cx & 1);
-                    x = xs;
-                    cx = 0u64.wrapping_sub(par);
-                } else {
-                    cx = ((x as i64) >> 63) as u64;
-                }
-                let open = q & x;
-                let close = q & !x;
-                let prev = (sep << 1) | ps;
-                ps = sep >> 63;
-                let after = (close << 1) | cl;
-                cl = close >> 63;
-                let bad = (open & !prev) | (after & !sep) | (x & sep);
+                let s1 = (sep << 1) | (ps >> 63);
+                let s2 = (sep << 2) | (ps >> 62);
+                let qs = (q << 1) | (pq >> 63);
+                ps = sep;
+                pq = q;
+                // A quote neither first nor last (or both) in its field.
+                let bad1 = qs & !(sep ^ s2);
+                // Opening quotes carried to the separator ending their field.
+                let mut land = 0u64;
+                cl = _addcarry_u64(cl, !sep, q & s1, &mut land);
+                let bad = bad1 | ((land ^ qs) & sep);
                 // Carry each bad bit to the next newline: ones at non-newlines.
-                let bnl = bad & n;
-                let (s1, o1) = (!n).overflowing_add(bad & !n);
-                let (s2, o2) = s1.overflowing_add(carry as u64);
-                carry = o1 | o2;
-                let badnl = ((s2 & n) | bnl) & n;
+                let mut t = 0u64;
+                cb = _addcarry_u64(cb, !n, bad & !n, &mut t);
+                let badnl = (t | bad) & n;
                 // Flatten separators (8 at a time, unconditionally).
                 let off = (b - pos) as u32;
                 let cnt = sep.count_ones() as usize;
@@ -129,22 +106,23 @@ impl Scanner {
                     }
                 }
                 wi += cnt;
-                // Flatten newlines with their bad flag.
+                // Flatten newlines (2 at a time); flag bad ones (rare).
                 let ncnt = n.count_ones() as usize;
                 let mut m = n;
                 for k in 0..2 {
-                    let t = m.trailing_zeros();
-                    *nl.add(wn + k) = off + t | (((badnl >> (t & 63)) & 1) as u32) << 31;
+                    *nl.add(wn + k) = off + m.trailing_zeros();
                     m &= m.wrapping_sub(1);
                 }
                 if ncnt > 2 {
                     let mut k = 2;
                     while m != 0 {
-                        let t = m.trailing_zeros();
-                        *nl.add(wn + k) = off + t | (((badnl >> t) & 1) as u32) << 31;
+                        *nl.add(wn + k) = off + m.trailing_zeros();
                         m &= m - 1;
                         k += 1;
                     }
+                }
+                if badnl != 0 {
+                    mark_bad(nl.add(wn), n, badnl);
                 }
                 wn += ncnt;
                 b += 64;
@@ -161,7 +139,7 @@ impl Scanner {
             for i in 0..wn {
                 let ent = *nl.add(i);
                 let end = ent & !BAD;
-                if ent & BAD == 0 && *idx.add(k + N - 1) == end {
+                if ent & BAD == 0 && *idx.add(k + N - 1) == end && (N > 1 || end != ls) {
                     let mut f0 = ls;
                     for f in 0..N {
                         let fe = *idx.add(k + f);
@@ -200,6 +178,19 @@ impl Scanner {
                 pos += ls as usize;
             }
         }
+    }
+}
+
+/// Flags the newline entries (flattened from `n` at `nl`) of the lines with
+/// a bit in `badnl`.
+#[cold]
+#[inline(never)]
+unsafe fn mark_bad(nl: *mut u32, n: u64, badnl: u64) {
+    let mut m = badnl;
+    while m != 0 {
+        let t = m.trailing_zeros();
+        *nl.add((n & ((1u64 << t) - 1)).count_ones() as usize) |= BAD;
+        m &= m - 1;
     }
 }
 
@@ -246,25 +237,62 @@ pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usi
 mod tests {
     use super::*;
 
-    fn check(text: &[u8]) {
-        // Reference: split every line.
-        let mut want: Vec<Vec<Vec<u8>>> = Vec::new();
+    type Lines = Vec<Vec<Vec<u8>>>;
+
+    fn want<const N: usize>(text: &[u8]) -> Lines {
+        let mut want = Vec::new();
         crate::csv::for_each_line(text, |line| {
-            let mut out = [&b""[..]; 3];
+            let mut out = [&b""[..]; N];
             if crate::csv::split(line, &mut out) {
                 want.push(out.iter().map(|f| f.to_vec()).collect());
             }
         });
+        want
+    }
+
+    /// Scans `text` (placed after a header line) as one range, and again as
+    /// a few ranges split at line starts, and compares with `csv::split`.
+    fn check_n<const N: usize>(text: &[u8], cuts: &[usize]) {
+        let want = want::<N>(text);
         let mut file = vec![b'h'; PAD];
         file.push(b'\n');
         let s = file.len();
         file.extend_from_slice(text);
-        let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
         let mut sc = Scanner::new();
-        scan_file::<3>(&mut sc, &file, s, file.len(), |p, st, en| {
-            got.push((0..3).map(|f| unsafe { std::slice::from_raw_parts(p.add(st[f] as usize), (en[f] - st[f]) as usize).to_vec() }).collect());
-        });
-        assert_eq!(got, want, "text {:?}", String::from_utf8_lossy(text));
+        let mut run = |a: usize, b: usize, got: &mut Lines| {
+            scan_file::<N>(&mut sc, &file, a, b, |p, st, en| {
+                got.push((0..N).map(|f| unsafe { std::slice::from_raw_parts(p.add(st[f] as usize), (en[f] - st[f]) as usize).to_vec() }).collect());
+            });
+        };
+        let mut got = Vec::new();
+        run(s, file.len(), &mut got);
+        assert_eq!(got, want, "N {} text {:?}", N, String::from_utf8_lossy(text));
+        // Ranges split at line starts (like the parallel callers).
+        let mut bounds = vec![s];
+        for &c in cuts {
+            let c = s + c % (text.len() + 1);
+            let c = match memchr::memchr(b'\n', &file[c..]) {
+                Some(x) => c + x + 1,
+                None => file.len(),
+            };
+            if c > *bounds.last().unwrap() && c < file.len() {
+                bounds.push(c);
+            }
+        }
+        bounds.push(file.len());
+        let mut got = Vec::new();
+        for w in bounds.windows(2) {
+            run(w[0], w[1], &mut got);
+        }
+        assert_eq!(got, want, "N {} cuts {:?} text {:?}", N, bounds, String::from_utf8_lossy(text));
+    }
+
+    fn check(text: &[u8], cuts: &[usize]) {
+        check_n::<1>(text, cuts);
+        check_n::<2>(text, cuts);
+        check_n::<3>(text, cuts);
+        check_n::<4>(text, cuts);
+        check_n::<7>(text, cuts);
     }
 
     #[test]
@@ -280,7 +308,7 @@ mod tests {
             rng ^= rng << 17;
             rng
         };
-        for it in 0..3000 {
+        for it in 0..4000 {
             let mut text = Vec::new();
             let lines = if it % 100 == 0 { 3000 } else { next() % 40 };
             if it % 300 == 7 {
@@ -290,20 +318,55 @@ mod tests {
                 text.extend(std::iter::repeat(b'y').take(20000));
                 text.extend_from_slice(b"\",,\n");
             }
+            let fmax = [3, 5, 8, 10][it % 4];
             for _ in 0..lines {
-                let fields = next() % 5;
+                let fields = next() % fmax;
                 for f in 0..fields {
                     if f > 0 {
                         text.push(b',');
                     }
-                    text.extend_from_slice(pieces[(next() % 16) as usize]);
+                    let r = next();
+                    if r % 4 == 0 {
+                        // A field of random length, often quoted, to put
+                        // quotes and separators at every block offset.
+                        let quoted = r & 16 != 0;
+                        if quoted {
+                            text.push(b'"');
+                        }
+                        let len = (r >> 8) % 70;
+                        text.extend(std::iter::repeat(b'v').take(len as usize));
+                        if (r >> 20) % 50 == 0 {
+                            text.push(b'"');
+                        }
+                        if quoted && (r >> 30) % 30 != 0 {
+                            text.push(b'"');
+                        }
+                    } else {
+                        text.extend_from_slice(pieces[(r >> 8) as usize % 16]);
+                    }
                 }
                 text.push(b'\n');
+            }
+            if it % 500 == 3 {
+                // Long lines (longer than a batch), good and bad.
+                for k in 0..3 {
+                    text.extend_from_slice(b"\"");
+                    text.extend(std::iter::repeat(b'w').take(BATCH + 100 * k));
+                    text.extend_from_slice(if k == 1 { b"\"x,b,c\n" } else { b"\",b,c\n" });
+                }
             }
             if next() % 3 == 0 {
                 text.pop();
             }
-            check(&text);
+            let cuts = [next() as usize, next() as usize, next() as usize];
+            check(&text, &cuts[..(it % 4)]);
+        }
+    }
+
+    #[test]
+    fn edges() {
+        for t in [&b""[..], b"\n", b"\n\n", b"a", b"\"", b"\"\"", b"a,b,c", b"\"a\",\"\",\"c\"\n", b"\"a,b\nc\"\n1,2,3\n", b"1,2,3\n\"\n1,2,3\n\"\n1,2,3"] {
+            check(t, &[]);
         }
     }
 }
