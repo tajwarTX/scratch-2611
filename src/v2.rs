@@ -1238,6 +1238,10 @@ pub fn run() -> bool {
             _ => None,
         }));
     }
+    if let Ok(mode) = std::env::var("FLOOR") {
+        floor(&mode, &jobs, [&link_maps, &event_maps, &click_maps], &ctx, threads);
+        return true;
+    }
     let per_pe = est_events / (threads * p2) * 5 / 4 + 64;
     let per_dd = est_events / (threads * p1) * 5 / 4 + 64;
     let mut a_states: Vec<AState> = (0..threads)
@@ -1599,3 +1603,80 @@ fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
     });
 }
 
+
+/// Probe only (FLOOR=read|tok|conv): the parse floors over every input line,
+/// with nothing written: read all bytes; read + tokenize; read + tokenize +
+/// every field conversion and validation. Prints wall and CPU seconds.
+fn floor(mode: &str, jobs: &[(u8, usize, usize, usize)], maps: [&Vec<Option<Mmap>>; 3], ctx: &Ctx, threads: usize) {
+    extern "C" {
+        fn getrusage(who: i32, ru: *mut [i64; 18]) -> i32;
+    }
+    let cpu = || {
+        let mut r = [0i64; 18];
+        unsafe { getrusage(0, &mut r) };
+        (r[0] + r[2]) as f64 + (r[1] + r[3]) as f64 / 1e6
+    };
+    let (t0, c0) = (Instant::now(), cpu());
+    let m = match mode { "read" => 0, "tok" => 1, _ => 2 };
+    let mut st: Vec<(u64, Scanner)> = (0..threads).map(|_| (0u64, Scanner::new())).collect();
+    run_jobs(&mut st, jobs.len(), |(sink, sc), j| {
+        let (kind, fi, s, e) = jobs[j];
+        let file: &[u8] = maps[kind as usize][fi].as_ref().unwrap();
+        if m == 0 {
+            unsafe {
+                use std::arch::x86_64::*;
+                let mut acc = _mm256_setzero_si256();
+                let mut i = s;
+                while i + 32 <= e {
+                    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_loadu_si256(file.as_ptr().add(i) as *const __m256i), _mm256_setzero_si256()));
+                    i += 32;
+                }
+                *sink = sink.wrapping_add(_mm256_extract_epi64::<0>(acc) as u64 ^ _mm256_extract_epi64::<2>(acc) as u64);
+            }
+            return;
+        }
+        let mut h = 0u64;
+        match kind {
+            0 => tok::scan_file::<2>(sc, file, s, e, |p, a, b| unsafe {
+                if m == 1 {
+                    h = h.wrapping_add((a[0] ^ b[1]) as u64);
+                } else {
+                    let (na, nb) = ((b[0] - a[0]) as usize, (b[1] - a[1]) as usize);
+                    if na != 0 && nb != 0 {
+                        h = h.wrapping_add(key_at(p.add(a[0] as usize), na) ^ key_at(p.add(a[1] as usize), nb));
+                    }
+                }
+            }),
+            1 => tok::scan_file::<7>(sc, file, s, e, |p, a, b| unsafe {
+                if m == 1 {
+                    h = h.wrapping_add((a[0] ^ a[2] ^ a[3] ^ b[6]) as u64);
+                } else if let Some(o) = convert_event(ctx, p, a, b) {
+                    h = h.wrapping_add(o.id ^ o.ingest.unwrap_or(0) as u64);
+                    if let Some(ev) = o.ev {
+                        h = h.wrapping_add(ev.person ^ ((ev.ts as u64) << 32 | ev.pc as u64));
+                    }
+                }
+            }),
+            _ => tok::scan_file::<4>(sc, file, s, e, |p, a, b| unsafe {
+                if m == 1 {
+                    h = h.wrapping_add((a[0] ^ b[3]) as u64);
+                    return;
+                }
+                let at = |i: usize| p.add(a[i] as usize);
+                let ln = |i: usize| (b[i] - a[i]) as usize;
+                if ln(0) == 0 || ln(1) == 0 {
+                    return;
+                }
+                let ts = match ts_at(ctx, at(3), ln(3)) {
+                    Some(t) if t >= ctx.ws - REACH && t < ctx.we => t,
+                    _ => return,
+                };
+                let Some(camp) = ctx.campaign(std::slice::from_raw_parts(at(2), ln(2))) else { return };
+                h = h.wrapping_add(key_at(at(1), ln(1)) ^ key_at(at(0), ln(0)) ^ ts as u64 ^ camp as u64);
+            }),
+        }
+        *sink = sink.wrapping_add(h);
+    });
+    let sink = st.iter().fold(0u64, |a, x| a ^ x.0);
+    eprintln!("FLOOR {} wall={:.4} cpu={:.3} sink={}", mode, t0.elapsed().as_secs_f64(), cpu() - c0, sink % 1000);
+}
