@@ -1273,7 +1273,10 @@ pub fn run() -> bool {
     let per_part2: usize = env("PER_PART2", &per_part.to_string()).parse().unwrap();
     crate::tok::BATCH_RT.store(env("BATCH", "16384").parse::<usize>().unwrap().clamp(1024, 16384), Ordering::Relaxed);
     D1TMP.store(env("D1TMP", "0") == "1", Ordering::Relaxed);
-    let p2_bits = bits_for(est_events, per_part2, 10.min(29 - tbits));
+    // At most 512 partitions of each kind: on the scorer more of them slow the
+    // parse scatter by more than smaller partitions save later (60M events:
+    // 1.86 s with 512/512 against 2.04 s with 2048/1024).
+    let p2_bits = bits_for(est_events, per_part2, 9.min(29 - tbits));
     let ctx = Ctx {
         ws_s: ws / 1000,
         ws,
@@ -1306,7 +1309,7 @@ pub fn run() -> bool {
         camp_slow,
         campaign_ids,
         channels,
-        p1_bits: bits_for(est_events, per_part1, 12),
+        p1_bits: bits_for(est_events, per_part1, 9),
         p2_bits,
         idx_bits: 32 - tbits - p2_bits,
         fast_ts: FastTs::new(ws - REACH - 10 * DAY, we + 10 * DAY),
