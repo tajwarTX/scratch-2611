@@ -13,7 +13,7 @@ while [ $i -lt 240 ]; do [ "$(grep '^Dirty:' /proc/meminfo | awk '{print int($2/
 SW=$(awk "BEGIN{printf \"%.1f\", $(now) - $t}")
 cat /scratch/p60/*/*.csv > /dev/null
 rm -rf /scratch/out; mkdir -p /scratch/out; NCPU=8 DATA_DIR=/scratch/p60 OUTPUT_DIR=/scratch/out /app/pipeline 2>/dev/null
-for order in "VA VB VC VD VE VF" "VD VE VF VA VB VC" "VF VC VA VE VD VB"; do
+for order in "VA VB VC VD VE VF" "VD VE VF VA VB VC"; do
   for v in $order; do
     rm -rf /scratch/out; mkdir -p /scratch/out; t=$(now)
     env $(venv $v) NCPU=8 DATA_DIR=/scratch/p60 OUTPUT_DIR=/scratch/out /app/maxrss /app/pipeline 2>/tmp/run.err
