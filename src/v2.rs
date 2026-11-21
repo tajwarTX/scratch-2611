@@ -290,7 +290,6 @@ struct AState {
     sc: Scanner,
     buf: Vec<u8>,
     bad: bool,
-    sink: u64,
 }
 
 const VIEW: u32 = u32::from_le_bytes(*b"view");
@@ -313,7 +312,7 @@ unsafe fn ts_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i64> {
         return fast::digits16(p.add(n), n).map(|v| v as i64);
     }
     if n == 20 || n == 25 {
-        if let Some(s) = ctx.fast_ts.dt_secs(p, n) {
+        if let Some(s) = ctx.fast_ts.dt_secs_simd(p, n) {
             return Some(s * 1000);
         }
     }
@@ -326,7 +325,7 @@ unsafe fn ts_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i64> {
 unsafe fn ingest_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i32> {
     let ws_s = ctx.ws / 1000;
     if n == 20 {
-        if let Some(s) = ctx.fast_ts.dt_secs(p, n) {
+        if let Some(s) = ctx.fast_ts.dt_secs_simd(p, n) {
             return i32::try_from(s - ws_s).ok();
         }
     }
@@ -337,91 +336,136 @@ unsafe fn ingest_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i32> {
     i32::try_from(ms / 1000 - ws_s).ok()
 }
 
+/// One event line's values: the dedup key and ingest (None: not whole
+/// seconds in range, the fast pipeline gives up), and the event record if
+/// the copy is valid.
+struct EvOut {
+    id: u64,
+    ingest: Option<i32>,
+    ev: Option<PEv>,
+}
+
+/// Converts one well-formed event line (field ranges `s`/`e` from `p`, PAD
+/// readable around each field). None: empty event_id, the line is dropped.
+#[inline(always)]
+unsafe fn convert_event(ctx: &Ctx, p: *const u8, s: &[u32; 7], e: &[u32; 7]) -> Option<EvOut> {
+    let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
+    let at = |i: usize| p.add(s[i] as usize);
+    let ln = |i: usize| (e[i] - s[i]) as usize;
+    if ln(0) == 0 {
+        return None;
+    }
+    let id = key_at(at(0), ln(0));
+    let ingest = ingest_at(ctx, at(3), ln(3));
+    let ingest_ms = ws + ingest.unwrap_or(0) as i64 * 1000;
+    let ev = 'valid: {
+        if ln(1) == 0 || ln(5) == 0 {
+            break 'valid None;
+        }
+        let ts = match ts_at(ctx, at(2), ln(2)) {
+            Some(t) if t >= ws && t < we => t,
+            _ => break 'valid None,
+        };
+        let tl = ln(4);
+        let tw = (at(4) as *const u32).read_unaligned();
+        let purchase = tl == 8 && (at(4) as *const u64).read_unaligned() == PURCHASE;
+        if !(purchase | ((tl == 4) & ((tw == VIEW) | (tw == CART)))) {
+            break 'valid None;
+        }
+        let mut pc = 0u32;
+        if purchase {
+            match parse_price(std::slice::from_raw_parts(at(6), ln(6))) {
+                Some(p) => pc = p,
+                None => break 'valid None,
+            }
+        }
+        if ingest_ms.saturating_sub(ts) > LATE {
+            break 'valid None;
+        }
+        if purchase {
+            pc |= ctx.category(std::slice::from_raw_parts(at(5), ln(5))) << 24;
+        }
+        Some(PEv { person: key_at(at(1), ln(1)), ts: (ts - base) as u32, pc })
+    };
+    Some(EvOut { id, ingest, ev })
+}
+
 #[inline(never)]
 fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState) {
-    let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
     let (p1, p2, ib) = (ctx.p1_bits, ctx.p2_bits, ctx.idx_bits);
     let loc_hi = st.tid << (p2 + ib);
     let idx_max = (1usize << ib) - 2;
-    let AState { pe, dd, sc, bad, sink, .. } = st;
-    let abl: u32 = env("ABL", "9").parse().unwrap();
+    let AState { pe, dd, sc, bad, .. } = st;
     tok::scan_file::<7>(sc, file, start, end, |p, s, e| unsafe {
-        let at = |i: usize| p.add(s[i] as usize);
-        let ln = |i: usize| (e[i] - s[i]) as usize;
-        if abl == 0 {
-            *sink += (s[3] ^ e[5]) as u64;
-            return;
-        }
-        if ln(0) == 0 {
-            return;
-        }
-        let id = key_at(at(0), ln(0));
-        let ingest = match ingest_at(ctx, at(3), ln(3)) {
-            Some(x) => x,
-            None => {
-                *bad = true;
-                0
-            }
-        };
-        let ingest_ms = ws + ingest as i64 * 1000;
-        if abl == 1 {
-            *sink += id ^ ingest_ms as u64;
-            return;
-        }
+        let Some(o) = convert_event(ctx, p, s, e) else { return };
+        let ingest = o.ingest.unwrap_or_else(|| {
+            *bad = true;
+            0
+        });
         let mut loc = NONE;
-        'valid: {
-            if ln(1) == 0 || ln(5) == 0 {
-                break 'valid;
-            }
-            let ts = match ts_at(ctx, at(2), ln(2)) {
-                Some(t) if t >= ws && t < we => t,
-                _ => break 'valid,
-            };
-            if abl == 21 {
-                *sink += ts as u64;
-                return;
-            }
-            let tl = ln(4);
-            let tw = (at(4) as *const u32).read_unaligned();
-            let purchase = tl == 8 && (at(4) as *const u64).read_unaligned() == PURCHASE;
-            if !(purchase | ((tl == 4) & ((tw == VIEW) | (tw == CART)))) {
-                break 'valid;
-            }
-            if abl == 22 {
-                *sink += ts as u64 + purchase as u64;
-                return;
-            }
-            let mut pc = 0u32;
-            if purchase {
-                match parse_price(std::slice::from_raw_parts(at(6), ln(6))) {
-                    Some(p) => pc = p,
-                    None => break 'valid,
-                }
-            }
-            if ingest_ms.saturating_sub(ts) > LATE {
-                break 'valid;
-            }
-            if purchase {
-                pc |= ctx.category(std::slice::from_raw_parts(at(5), ln(5))) << 24;
-            }
-            let user = key_at(at(1), ln(1));
-            if abl == 2 {
-                *sink += user ^ ts as u64 ^ pc as u64;
-                return;
-            }
-            let pp = part(user, p2);
-            let idx = pe.push(pp, PEv { person: user, ts: (ts - base) as u32, pc }) as usize;
+        if let Some(ev) = o.ev {
+            let pp = part(ev.person, p2);
+            let idx = pe.push(pp, ev) as usize;
             if idx > idx_max {
                 *bad = true;
             }
             loc = loc_hi | ((pp as u32) << ib) | (idx as u32 & ((1 << ib) - 1));
         }
-        if abl == 3 {
-            *sink += loc as u64;
-            return;
-        }
-        dd.push(part(id, p1), Dd { id, ingest, loc });
+        dd.push(part(o.id, p1), Dd { id: o.id, ingest, loc });
     });
+}
+
+/// CBENCH=1: single-thread cost of `convert_event` alone, over the largest
+/// event file's lines pre-tokenized in memory.
+fn conv_bench(ctx: &Ctx, maps: &[Option<Mmap>]) {
+    let m = maps.iter().flatten().max_by_key(|m| m.len()).unwrap();
+    let file: &[u8] = &m[..];
+    let mut lines: Vec<([u32; 7], [u32; 7])> = Vec::new();
+    let mut sc = Scanner::new();
+    let base = file.as_ptr();
+    tok::scan_file::<7>(&mut sc, file, crate::csv::after_header(file), file.len(), |p, s, e| {
+        if p == base {
+            lines.push((*s, *e));
+        }
+    });
+    let mode: u32 = env("CBENCH", "9").parse().unwrap();
+    for round in 0..3 {
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for (s, e) in &lines {
+            if mode < 9 {
+                unsafe {
+                    let p = base;
+                    let at = |i: usize| p.add(s[i] as usize);
+                    let ln = |i: usize| (e[i] - s[i]) as usize;
+                    let v = match mode {
+                        0 => (s[3] ^ e[2]) as u64,
+                        1 => key_at(at(0), ln(0)),
+                        2 => key_at(at(0), ln(0)) ^ key_at(at(1), ln(1)),
+                        3 => ingest_at(ctx, at(3), ln(3)).unwrap_or(0) as u64,
+                        4 => ts_at(ctx, at(2), ln(2)).unwrap_or(0) as u64,
+                        5 => {
+                            let tl = ln(4);
+                            let tw = (at(4) as *const u32).read_unaligned();
+                            let purchase = tl == 8 && (at(4) as *const u64).read_unaligned() == PURCHASE;
+                            (purchase | ((tl == 4) & ((tw == VIEW) | (tw == CART)))) as u64
+                        }
+                        6 => ctx.fast_ts.dt_secs(at(3), 20).unwrap_or(0) as u64,
+                        _ => ctx.fast_ts.dt_secs_simd(at(3), 20).unwrap_or(0) as u64,
+                    };
+                    sink = sink.wrapping_add(v);
+                }
+                continue;
+            }
+            if let Some(o) = unsafe { convert_event(ctx, base, s, e) } {
+                sink = sink.wrapping_add(o.id ^ o.ingest.unwrap_or(0) as u64);
+                if let Some(ev) = o.ev {
+                    sink = sink.wrapping_add(ev.person ^ ev.ts as u64 ^ ev.pc as u64);
+                }
+            }
+        }
+        eprintln!("conv round {} {:.1} ns/line ({} lines, sink {})", round, t.elapsed().as_nanos() as f64 / lines.len() as f64, lines.len(), sink % 7);
+    }
 }
 
 #[inline(never)]
@@ -897,6 +941,10 @@ pub fn run() -> bool {
         fast_ts: FastTs::new(ws - REACH - 10 * DAY, we + 10 * DAY),
     };
     let (p1, p2) = (1usize << ctx.p1_bits, 1usize << ctx.p2_bits);
+    if std::env::var("CBENCH").is_ok() {
+        conv_bench(&ctx, &event_maps);
+        return true;
+    }
     log!(t0, "setup: {} threads, {} MB events, p1={} p2={}", threads, event_bytes >> 20, p1, p2);
 
     // A: parse links (first, into the shared union-find), events and clicks, all in one pool.
@@ -921,7 +969,6 @@ pub fn run() -> bool {
             sc: Scanner::new(),
             buf: Vec::new(),
             bad: false,
-            sink: 0,
         })
         .collect();
     let readio = env("READIO", "0") == "1";

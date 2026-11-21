@@ -245,6 +245,66 @@ impl FastTs {
         None
     }
 
+    /// `dt_secs` with one 32-byte AVX2 pass: digits and separators checked
+    /// against templates, digit pairs combined with one multiply-add. Same
+    /// results as `dt_secs` (32 bytes at `p` readable).
+    #[inline(always)]
+    pub unsafe fn dt_secs_simd(&self, p: *const u8, n: usize) -> Option<i64> {
+        use std::arch::x86_64::*;
+        let v = _mm256_loadu_si256(p as *const __m256i);
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let isdig = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d)) as u32;
+        // Template: '-' at 4, 7; 'T' at 10; ':' at 13, 16, 22.
+        let tmpl = _mm256_setr_epi8(
+            0, 0, 0, 0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0,
+            b':' as i8, 0, 0, 0, 0, 0, b':' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let iseq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, tmpl)) as u32;
+        const DIG1: u32 = 0b0000_0000_0000_0110_1101_1011_0110_1111; // 0-3,5,6,8,9,11,12,14,15,17,18
+        const SEP1: u32 = (1 << 4) | (1 << 7) | (1 << 10) | (1 << 13) | (1 << 16);
+        const DIG2: u32 = DIG1 | (1 << 20) | (1 << 21) | (1 << 23) | (1 << 24);
+        const SEP2: u32 = SEP1 | (1 << 22);
+        let (dig, sep) = if n == 20 { (DIG1, SEP1) } else { (DIG2, SEP2) };
+        // Pairs: lane 0 -> MM (5,6), DD (8,9), HH (11,12), MI (14,15); lane 1 -> SS (17,18), OH (20,21), OM (23,24).
+        let shuf = _mm256_setr_epi8(
+            5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1,
+            1, 2, 4, 5, 7, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        );
+        let pairs = _mm256_maddubs_epi16(_mm256_shuffle_epi8(d, shuf), _mm256_set1_epi16(0x010A));
+        // Words: [MM, DD, HH, MI, 0..] [SS, OH, OM, 0..]; each must be <= its limit.
+        let lim = _mm256_setr_epi16(99, 99, 23, 59, 0, 0, 0, 0, 59, 23, 59, 0, 0, 0, 0, 0);
+        let over = _mm256_movemask_epi8(_mm256_cmpgt_epi16(pairs, lim)) as u32;
+        let zone = *p.add(19);
+        let lo = _mm256_castsi256_si128(pairs);
+        let hi = _mm256_extracti128_si256(pairs, 1);
+        let w = _mm_cvtsi128_si64(lo) as u64;
+        let w2 = _mm_cvtsi128_si64(hi) as u64;
+        let dd = ((w >> 16) & 0xFFFF) as u32;
+        let hh = ((w >> 32) & 0xFFFF) as i64;
+        let mi = ((w >> 48) & 0xFFFF) as i64;
+        let ss = (w2 & 0xFFFF) as i64;
+        let key = (p as *const u64).read_unaligned();
+        let t = *self.by_ym.get_unchecked(ym_slot(key));
+        let hit = t.0 == key;
+        let ok_date = hit & (dd >= t.2) & (dd <= t.3);
+        let mut ok = (isdig & dig) == dig && (iseq & sep) == sep && ok_date;
+        let mut secs = (t.1 + dd as i64 - 1) * 86_400 + hh * 3_600 + mi * 60 + ss;
+        if n == 20 {
+            ok &= zone == b'Z' && (over & 0x0003_00FF) == 0;
+        } else {
+            let oh = ((w2 >> 16) & 0xFFFF) as i64;
+            let om = ((w2 >> 32) & 0xFFFF) as i64;
+            ok &= (zone == b'+' || zone == b'-') && (over & 0x003F_00FF) == 0;
+            let off = oh * 3_600 + om * 60;
+            secs -= if zone == b'+' { off } else { -off };
+        }
+        if ok {
+            Some(secs)
+        } else {
+            None
+        }
+    }
+
     /// Epoch seconds of an F1 (`n == 20`) or F2 (`n == 25`) value at `p`
     /// (24 bytes readable), branch-free on the common path; None means "not
     /// handled here" (the caller then uses `parse`, exact for everything).
@@ -385,7 +445,10 @@ mod fast_tests {
                 }
                 let mut buf = t.to_vec();
                 buf.extend_from_slice(&[0xAA; 32]);
-                unsafe { fast.dt_secs(buf.as_ptr(), t.len()) }.map(|s| s * 1000)
+                let a = unsafe { fast.dt_secs(buf.as_ptr(), t.len()) };
+                let b = unsafe { fast.dt_secs_simd(buf.as_ptr(), t.len()) };
+                assert_eq!(a, b, "simd {:?}", String::from_utf8_lossy(t));
+                a.map(|s| s * 1000)
             };
             for c in &cases {
                 if let Some(v) = dt(c.as_bytes()) {
