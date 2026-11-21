@@ -520,6 +520,8 @@ struct CState {
     win: Vec<u32>,
     active: Vec<u32>,
     pos: Vec<u32>,
+    act: Vec<[u32; 2]>,
+    segs: Vec<(u32, u32)>,
     cats: Vec<(u32, u64)>,
 }
 
@@ -530,7 +532,33 @@ struct Walk<'a> {
     win: &'a mut Vec<u32>,
     active: &'a mut Vec<u32>,
     pos: &'a mut Vec<u32>,
+    act: &'a mut Vec<[u32; 2]>,
+    segs: &'a mut Vec<(u32, u32)>,
     cats: &'a mut Vec<(u32, u64)>,
+}
+
+/// Credits campaign `c` an assist for each of the person's sessions in
+/// [act[c][0], b): per day, from the day segments `segs` (day index, first
+/// session), starting at segment act[c][1].
+#[inline(always)]
+fn close_assist(asst: &mut [u64], segs: &[(u32, u32)], act: [u32; 2], b: u32, c: usize, nc: usize) {
+    let a = act[0];
+    if a >= b {
+        return;
+    }
+    let mut g = act[1] as usize;
+    loop {
+        let (di, first) = unsafe { *segs.get_unchecked(g) };
+        let end = if g + 1 < segs.len() { unsafe { segs.get_unchecked(g + 1).1 }.min(b) } else { b };
+        let from = a.max(first);
+        if end > from {
+            unsafe { *asst.get_unchecked_mut(di as usize * nc + c) += (end - from) as u64 };
+        }
+        if end >= b {
+            return;
+        }
+        g += 1;
+    }
 }
 
 /// Below this many records a comparison sort beats the radix sort.
@@ -601,7 +629,11 @@ fn process_person(person: u64, evs: &[u64], cks: &[Ck], ctx: &Ctx, w: &mut Walk)
     let mut k = 0usize;
     let mut cur_day = i64::MIN;
     let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0u64);
+    // Session count so far; assists are credited per interval of sessions a
+    // campaign stays in the window (see close_assist).
+    let mut ns = 0u32;
     w.cats.clear();
+    w.segs.clear();
     while k < n {
         let start = (evs[k] >> 32) as u32;
         let day = (ctx.base + start as i64).div_euclid(DAY);
@@ -617,6 +649,7 @@ fn process_person(person: u64, evs: &[u64], cks: &[Ck], ctx: &Ctx, w: &mut Walk)
                 });
             }
             cur_day = day;
+            w.segs.push(((day - ctx.day_lo) as u32, ns));
             d_sessions = 0;
             d_events = 0;
             d_revenue = 0;
@@ -654,6 +687,7 @@ fn process_person(person: u64, evs: &[u64], cks: &[Ck], ctx: &Ctx, w: &mut Walk)
             if w.win[c] == 0 {
                 w.pos[c] = w.active.len() as u32;
                 w.active.push(c as u32);
+                w.act[c] = [ns, w.segs.len() as u32 - 1];
             }
             w.win[c] += 1;
             hi += 1;
@@ -662,6 +696,7 @@ fn process_person(person: u64, evs: &[u64], cks: &[Ck], ctx: &Ctx, w: &mut Walk)
             let c = cks[lo].camp as usize;
             w.win[c] -= 1;
             if w.win[c] == 0 {
+                close_assist(w.asst, w.segs, w.act[c], ns, c, nc);
                 let at = w.pos[c] as usize;
                 let moved = *w.active.last().unwrap();
                 w.active.swap_remove(at);
@@ -691,10 +726,7 @@ fn process_person(person: u64, evs: &[u64], cks: &[Ck], ctx: &Ctx, w: &mut Walk)
         a[0] += 1;
         a[1] += s_purchase as u64;
         a[2] += s_revenue;
-        let row = &mut w.asst[di * nc..(di + 1) * nc];
-        for &c in w.active.iter() {
-            row[c as usize] += 1;
-        }
+        ns += 1;
         k = m;
     }
     if cur_day != i64::MIN {
@@ -708,6 +740,7 @@ fn process_person(person: u64, evs: &[u64], cks: &[Ck], ctx: &Ctx, w: &mut Walk)
         });
     }
     for &c in w.active.iter() {
+        close_assist(w.asst, w.segs, w.act[c as usize], ns, c as usize, nc);
         w.win[c as usize] = 0;
     }
     w.active.clear();
@@ -845,6 +878,8 @@ fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scat
         win,
         active,
         pos,
+        act,
+        segs,
         cats,
     } = st;
     let any_rd = load_redirects(rd, j, rmap, roots);
@@ -918,7 +953,7 @@ fn process_partition(st: &mut CState, srcs: &[AState], ms: &[MState], rd: &[Scat
             *p += 1;
         }
     });
-    let mut w = Walk { rows, acc, asst, win, active, pos, cats };
+    let mut w = Walk { rows, acc, asst, win, active, pos, act, segs, cats };
     for p in 0..np {
         let (es, ee) = (ev_start[p] as usize, ev_start[p + 1] as usize);
         if es == ee {
@@ -1161,6 +1196,8 @@ pub fn run() -> bool {
             win: vec![0u32; ncamp + 1],
             active: Vec::new(),
             pos: vec![0u32; ncamp + 1],
+            act: vec![[0u32; 2]; ncamp + 1],
+            segs: Vec::new(),
             cats: Vec::new(),
         })
         .collect();
