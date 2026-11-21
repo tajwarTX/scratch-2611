@@ -1240,17 +1240,26 @@ pub fn run() -> bool {
     }
     let per_pe = est_events / (threads * p2) * 5 / 4 + 64;
     let per_dd = est_events / (threads * p1) * 5 / 4 + 64;
-    let mut a_states: Vec<AState> = (0..threads)
-        .map(|t| AState {
-            tid: t as u32,
-            pe: Scatter16::new(p2, per_pe),
-            dd: Scatter16::new(p1, per_dd),
-            pc: Scatter::new(p2, per_pe / 4),
-            sc: Scanner::new(),
-            buf: Vec::new(),
-            bad: false,
+    log!(t0, "jobs");
+    let make = |t: usize| AState {
+        tid: t as u32,
+        pe: Scatter16::new(p2, per_pe),
+        dd: Scatter16::new(p1, per_dd),
+        pc: Scatter::new(p2, per_pe / 4),
+        sc: Scanner::new(),
+        buf: Vec::new(),
+        bad: false,
+    };
+    // Each thread allocates (and so first-touches) its own buffers, in parallel.
+    let mut a_states: Vec<AState> = if env("PALLOC", "1") == "1" {
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads).map(|t| sc.spawn(move || make(t))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
         })
-        .collect();
+    } else {
+        (0..threads).map(make).collect()
+    };
+    log!(t0, "alloc");
     let readio = env("READIO", "0") == "1";
     let open = |dir: &str| -> Vec<std::fs::File> {
         list_csv(&data.join(dir)).iter().map(|p| std::fs::File::open(p).expect("open")).collect()
@@ -1302,11 +1311,13 @@ pub fn run() -> bool {
         }
         st.buf = buf;
     });
+    log!(t0, "pool");
     a_states.iter_mut().for_each(|s| {
         s.pe.flush();
         s.dd.flush();
         s.pc.flush();
     });
+    log!(t0, "flush");
     // Every linked ID and its person (itself for the set's smallest ID).
     let mut rd: Vec<Scatter16<Rd>>;
     {
