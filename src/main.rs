@@ -28,7 +28,7 @@ use parquet::data_type::ByteArray;
 
 use csv::{after_header, for_each_line, for_each_record, split};
 use keys::{any_interned, cmp_key, key_bytes, key_of, pack};
-use table::{mix, IndexTable, U64Map};
+use table::{mix, IndexTable, LocalMap, U64Map};
 use ts::{parse_price, parse_ts, FastTs};
 
 const GAP: i64 = 1_800_000;
@@ -310,6 +310,12 @@ struct BState {
 struct CState {
     evs: Vec<PEvent>,
     cks: Vec<PClick>,
+    pmap: LocalMap,
+    persons: Vec<u64>,
+    local: Vec<u32>,
+    ev_start: Vec<u32>,
+    ck_start: Vec<u32>,
+    cursor: Vec<u32>,
     rows: Vec<UserRow>,
     acc: Vec<[u64; 4]>,
     stamp: Vec<u32>,
@@ -498,34 +504,92 @@ struct CStateParts<'a> {
     cats: &'a mut Vec<(u32, u64)>,
 }
 
-#[inline(never)]
-fn process_partition(st: &mut CState, ctx: &Ctx) {
-    let interned = any_interned();
-    st.evs.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-    if interned {
-        st.cks.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then(cmp_key(b.id, a.id)));
-    } else {
-        st.cks.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then(b.id.cmp(&a.id)));
+/// Exclusive prefix sums of `counts` into `starts` (len + 1 entries).
+fn prefix(counts: &[u32], starts: &mut Vec<u32>) {
+    starts.clear();
+    let mut total = 0u32;
+    for &c in counts {
+        starts.push(total);
+        total += c;
     }
-    let CState { evs, cks, rows, acc, stamp, serial, cats } = st;
+    starts.push(total);
+}
+
+/// One person partition: group events and clicks by person with a counting
+/// sort on a local person index, sort each person's few rows by time, walk.
+#[inline(never)]
+fn process_partition(st: &mut CState, srcs: &[BState], j: usize, ctx: &Ctx) {
+    let interned = any_interned();
+    let CState { evs, cks, pmap, persons, local, ev_start, ck_start, cursor, rows, acc, stamp, serial, cats } = st;
+    let n: usize = srcs.iter().map(|s| s.pe.parts[j].len()).sum();
+    pmap.reset(n / 8 + 16);
+    persons.clear();
+    local.clear();
+    cursor.clear();
+    for s in srcs {
+        for e in &s.pe.parts[j] {
+            let (idx, inserted) = pmap.get_or_insert(e.person, persons.len() as u32);
+            if inserted {
+                persons.push(e.person);
+                cursor.push(0);
+            }
+            cursor[idx as usize] += 1;
+            local.push(idx);
+        }
+    }
+    let np = persons.len();
+    prefix(cursor, ev_start);
+    cursor.copy_from_slice(&ev_start[..np]);
+    evs.clear();
+    evs.resize(n, PEvent::default());
+    let mut k = 0usize;
+    for s in srcs {
+        for e in &s.pe.parts[j] {
+            let idx = local[k] as usize;
+            k += 1;
+            let pos = cursor[idx] as usize;
+            cursor[idx] += 1;
+            evs[pos] = *e;
+        }
+    }
+    local.clear();
+    cursor.iter_mut().for_each(|c| *c = 0);
+    for s in srcs {
+        for c in &s.pc.parts[j] {
+            let idx = pmap.get(c.person).unwrap_or(u32::MAX);
+            if idx != u32::MAX {
+                cursor[idx as usize] += 1;
+            }
+            local.push(idx);
+        }
+    }
+    prefix(cursor, ck_start);
+    cursor.copy_from_slice(&ck_start[..np]);
+    cks.clear();
+    cks.resize(ck_start[np] as usize, PClick::default());
+    let mut k = 0usize;
+    for s in srcs {
+        for c in &s.pc.parts[j] {
+            let idx = local[k];
+            k += 1;
+            if idx != u32::MAX {
+                let pos = cursor[idx as usize] as usize;
+                cursor[idx as usize] += 1;
+                cks[pos] = *c;
+            }
+        }
+    }
     let mut parts = CStateParts { rows, acc, stamp, serial, cats };
-    let (mut i, mut ci) = (0usize, 0usize);
-    while i < evs.len() {
-        let person = evs[i].person;
-        let mut j = i + 1;
-        while j < evs.len() && evs[j].person == person {
-            j += 1;
+    for p in 0..np {
+        let pe = &mut evs[ev_start[p] as usize..ev_start[p + 1] as usize];
+        pe.sort_unstable_by_key(|e| e.ts);
+        let pc = &mut cks[ck_start[p] as usize..ck_start[p + 1] as usize];
+        if interned {
+            pc.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then(cmp_key(b.id, a.id)));
+        } else {
+            pc.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then(b.id.cmp(&a.id)));
         }
-        while ci < cks.len() && cks[ci].person < person {
-            ci += 1;
-        }
-        let mut cj = ci;
-        while cj < cks.len() && cks[cj].person == person {
-            cj += 1;
-        }
-        process_person(person, &evs[i..j], &cks[ci..cj], ctx, &mut parts);
-        i = j;
-        ci = cj;
+        process_person(persons[p], pe, pc, ctx, &mut parts);
     }
 }
 
@@ -722,6 +786,12 @@ fn main() {
         .map(|_| CState {
             evs: Vec::new(),
             cks: Vec::new(),
+            pmap: LocalMap::new(),
+            persons: Vec::new(),
+            local: Vec::new(),
+            ev_start: Vec::new(),
+            ck_start: Vec::new(),
+            cursor: Vec::new(),
             rows: Vec::new(),
             acc: vec![[0u64; 4]; (ncamp + 1) * ndays],
             stamp: vec![0u32; ncamp + 1],
@@ -732,15 +802,7 @@ fn main() {
     {
         let b = &b_states;
         let ctx = &ctx;
-        run_jobs(&mut c_states, p2, |st, j| {
-            st.evs.clear();
-            st.cks.clear();
-            for s in b {
-                st.evs.extend_from_slice(&s.pe.parts[j]);
-                st.cks.extend_from_slice(&s.pc.parts[j]);
-            }
-            process_partition(st, ctx);
-        });
+        run_jobs(&mut c_states, p2, |st, j| process_partition(st, b, j, ctx));
     }
     drop(b_states);
     let user_rows: usize = c_states.iter().map(|s| s.rows.len()).sum();

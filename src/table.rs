@@ -162,3 +162,87 @@ impl IndexTable {
         }
     }
 }
+
+/// Small growable map from non-zero u64 keys to dense u32 indexes, reset per
+/// partition and sized to stay in cache.
+pub struct LocalMap {
+    keys: Vec<u64>,
+    vals: Vec<u32>,
+    mask: usize,
+    len: usize,
+}
+
+impl LocalMap {
+    pub fn new() -> Self {
+        LocalMap { keys: Vec::new(), vals: Vec::new(), mask: 0, len: 0 }
+    }
+
+    pub fn reset(&mut self, expect: usize) {
+        let cap = (expect * 2).max(64).next_power_of_two();
+        if self.keys.len() != cap {
+            self.keys = vec![0; cap];
+            self.vals = vec![0; cap];
+        } else {
+            self.keys.iter_mut().for_each(|k| *k = 0);
+        }
+        self.mask = cap - 1;
+        self.len = 0;
+    }
+
+    /// The index for `k`, inserting `next` if absent (second value: inserted).
+    #[inline(always)]
+    pub fn get_or_insert(&mut self, k: u64, next: u32) -> (u32, bool) {
+        if (self.len + 1) * 2 > self.keys.len() {
+            self.grow();
+        }
+        let mut i = mix(k) as usize & self.mask;
+        loop {
+            let sk = unsafe { *self.keys.get_unchecked(i) };
+            if sk == k {
+                return (unsafe { *self.vals.get_unchecked(i) }, false);
+            }
+            if sk == 0 {
+                unsafe {
+                    *self.keys.get_unchecked_mut(i) = k;
+                    *self.vals.get_unchecked_mut(i) = next;
+                }
+                self.len += 1;
+                return (next, true);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self, k: u64) -> Option<u32> {
+        let mut i = mix(k) as usize & self.mask;
+        loop {
+            let sk = unsafe { *self.keys.get_unchecked(i) };
+            if sk == k {
+                return Some(unsafe { *self.vals.get_unchecked(i) });
+            }
+            if sk == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let (old_keys, old_vals) = (std::mem::take(&mut self.keys), std::mem::take(&mut self.vals));
+        let cap = old_keys.len() * 2;
+        self.keys = vec![0; cap];
+        self.vals = vec![0; cap];
+        self.mask = cap - 1;
+        for (k, v) in old_keys.into_iter().zip(old_vals) {
+            if k != 0 {
+                let mut i = mix(k) as usize & self.mask;
+                while self.keys[i] != 0 {
+                    i = (i + 1) & self.mask;
+                }
+                self.keys[i] = k;
+                self.vals[i] = v;
+            }
+        }
+    }
+}
