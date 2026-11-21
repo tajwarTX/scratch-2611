@@ -526,23 +526,27 @@ struct CState {
     cursor: Vec<u32>,
     rows: Vec<UserRow>,
     acc: Vec<[u64; 4]>,
-    stamp: Vec<u32>,
-    serial: u32,
+    asst: Vec<u64>,
+    win: Vec<u32>,
+    active: Vec<u32>,
+    pos: Vec<u32>,
     cats: Vec<(u32, u64)>,
 }
 
 struct Walk<'a> {
     rows: &'a mut Vec<UserRow>,
     acc: &'a mut Vec<[u64; 4]>,
-    stamp: &'a mut Vec<u32>,
-    serial: &'a mut u32,
+    asst: &'a mut Vec<u64>,
+    win: &'a mut Vec<u32>,
+    active: &'a mut Vec<u32>,
+    pos: &'a mut Vec<u32>,
     cats: &'a mut Vec<(u32, u64)>,
 }
 
 /// One person's events (sorted by ts) and clicks (sorted by ts, then
 /// click_id descending): sessions, credit, assists, daily rows.
 fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk) {
-    let ndays = ctx.ndays;
+    let _ = ctx.ndays;
     let organic = ctx.campaign_ids.len();
     let reach = REACH as u32;
     let (mut lo, mut hi) = (0usize, 0usize);
@@ -590,32 +594,41 @@ fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk
         d_events += (m - k) as u32;
         d_revenue += s_revenue;
 
+        // The window is the person's clicks with start - 7 days <= ts <= start.
+        // win[c] counts campaign c's clicks in it; `active` lists the
+        // campaigns with a nonzero count (pos[c] = index in `active`).
         while hi < cks.len() && cks[hi].ts <= start {
+            let c = cks[hi].camp as usize;
+            if w.win[c] == 0 {
+                w.pos[c] = w.active.len() as u32;
+                w.active.push(c as u32);
+            }
+            w.win[c] += 1;
             hi += 1;
         }
         while lo < hi && cks[lo].ts < start - reach {
+            let c = cks[lo].camp as usize;
+            w.win[c] -= 1;
+            if w.win[c] == 0 {
+                let at = w.pos[c] as usize;
+                let moved = *w.active.last().unwrap();
+                w.active.swap_remove(at);
+                if (moved as usize) != c {
+                    w.pos[moved as usize] = at as u32;
+                }
+            }
             lo += 1;
         }
         let di = (day - ctx.day_lo) as usize;
         let camp = if lo < hi { cks[hi - 1].camp as usize } else { organic };
-        let a = &mut w.acc[camp * ndays + di];
+        let nc = organic + 1;
+        let a = &mut w.acc[di * nc + camp];
         a[0] += 1;
         a[1] += s_purchase as u64;
         a[2] += s_revenue;
-        if lo < hi {
-            *w.serial = w.serial.wrapping_add(1);
-            if *w.serial == 0 {
-                w.stamp.iter_mut().for_each(|s| *s = 0);
-                *w.serial = 1;
-            }
-            let serial = *w.serial;
-            for c in &cks[lo..hi] {
-                let ci = c.camp as usize;
-                if w.stamp[ci] != serial {
-                    w.stamp[ci] = serial;
-                    w.acc[ci * ndays + di][3] += 1;
-                }
-            }
+        let row = &mut w.asst[di * nc..(di + 1) * nc];
+        for &c in w.active.iter() {
+            row[c as usize] += 1;
         }
         k = m;
     }
@@ -629,12 +642,16 @@ fn process_person(person: u64, evs: &[PEv], cks: &[PCk], ctx: &Ctx, w: &mut Walk
             top: top_category(w.cats),
         });
     }
+    for &c in w.active.iter() {
+        w.win[c as usize] = 0;
+    }
+    w.active.clear();
 }
 
 #[inline(never)]
 fn process_partition(st: &mut CState, srcs: &[AState], j: usize, ctx: &Ctx) {
     let interned = any_interned();
-    let CState { evs, cks, pmap, persons, local, ev_start, ck_start, cursor, rows, acc, stamp, serial, cats } = st;
+    let CState { evs, cks, pmap, persons, local, ev_start, ck_start, cursor, rows, acc, asst, win, active, pos, cats } = st;
     let n: usize = srcs.iter().map(|s| s.pe.len(j)).sum();
     pmap.reset(n / 8 + 16);
     persons.clear();
@@ -699,7 +716,7 @@ fn process_partition(st: &mut CState, srcs: &[AState], j: usize, ctx: &Ctx) {
             }
         }
     }
-    let mut w = Walk { rows, acc, stamp, serial, cats };
+    let mut w = Walk { rows, acc, asst, win, active, pos, cats };
     for p in 0..np {
         let pe = &mut evs[ev_start[p] as usize..ev_start[p + 1] as usize];
         pe.sort_unstable_by_key(|e| e.ts);
@@ -900,15 +917,20 @@ pub fn run() -> bool {
             cursor: Vec::new(),
             rows: Vec::new(),
             acc: vec![[0u64; 4]; (ncamp + 1) * ndays],
-            stamp: vec![0u32; ncamp + 1],
-            serial: 0,
+            asst: vec![0u64; (ncamp + 1) * ndays],
+            win: vec![0u32; ncamp + 1],
+            active: Vec::new(),
+            pos: vec![0u32; ncamp + 1],
             cats: Vec::new(),
         })
         .collect();
     {
         let a = &a_states;
         let ctx = &ctx;
-        run_jobs(&mut c_states, p2, |st, j| process_partition(st, a, j, ctx));
+        let mut order: Vec<usize> = (0..p2).collect();
+        let size = |j: usize| a.iter().map(|s| s.pe.len(j) + s.pc.parts[j].len()).sum::<usize>();
+        order.sort_unstable_by_key(|&j| std::cmp::Reverse(size(j)));
+        run_jobs(&mut c_states, p2, |st, k| process_partition(st, a, order[k], ctx));
     }
     log!(t0, "sessions");
 
@@ -924,12 +946,16 @@ fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
     std::fs::create_dir_all(&user_dir).expect("user_daily dir");
     std::fs::create_dir_all(&camp_dir).expect("campaign_daily dir");
     let (ncamp, ndays) = (ctx.campaign_ids.len(), ctx.ndays);
+    // Merge per-thread counters (day-major: index day * (ncamp + 1) + camp).
     let mut acc = vec![[0u64; 4]; (ncamp + 1) * ndays];
     for s in c_states {
         for (t, x) in acc.iter_mut().zip(&s.acc) {
-            for i in 0..4 {
+            for i in 0..3 {
                 t[i] += x[i];
             }
+        }
+        for (t, x) in acc.iter_mut().zip(&s.asst) {
+            t[3] += x;
         }
     }
     std::thread::scope(|sc| {
@@ -976,7 +1002,7 @@ fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for camp in 0..=ncamp {
                 for d in 0..ndays {
-                    let a = acc[camp * ndays + d];
+                    let a = acc[d * (ncamp + 1) + camp];
                     if a[0] == 0 && a[3] == 0 {
                         continue;
                     }
