@@ -966,6 +966,9 @@ fn walk_groups(st: &mut CState, from: usize, ctx: &Ctx) {
 }
 
 static SKIP: AtomicU32 = AtomicU32::new(0);
+/// Experiment: the grouping pass keeps each row's sort key, so the placing
+/// pass does not read the rows again.
+static D1TMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// D1: one person partition's own rows, grouped by ID with a counting sort on
 /// a local index. Linked IDs (this partition's redirect records, roots
@@ -977,7 +980,7 @@ fn process_partition(st: &mut CState, mv: &mut MState, srcs: &[AState], rd: &[Sc
     let p2 = ctx.p2_bits;
     let nl;
     {
-        let CState { evs, cks, pmap, persons, roots, local, ev_start, ck_start, cursor, .. } = &mut *st;
+        let CState { evs, cks, ev_tmp, pmap, persons, roots, local, ev_start, ck_start, cursor, .. } = &mut *st;
         let nrd: usize = rd.iter().map(|r| r.len(j)).sum();
         let n: usize = srcs.iter().map(|s| s.pe.len(j)).sum();
         pmap.reset(n / 16 + nrd + 64, p2);
@@ -996,37 +999,68 @@ fn process_partition(st: &mut CState, mv: &mut MState, srcs: &[AState], rd: &[Sc
         cursor.resize(nl, 0);
         local.clear();
         local.reserve(n);
+        // Room for every row to start a group, so the loop needs no growth
+        // checks: a row writes the next group's slot and keeps it if it is new.
+        persons.reserve(n + 1);
+        cursor.reserve(n + 1);
+        let (pp, cp, lp) = (persons.as_mut_ptr(), cursor.as_mut_ptr(), local.as_mut_ptr());
+        let (mut np, mut nrow) = (nl, 0usize);
+        let keep = D1TMP.load(Ordering::Relaxed);
+        if keep {
+            ev_tmp.clear();
+            ev_tmp.reserve(n);
+        }
+        let tp = ev_tmp.as_mut_ptr();
         for s in srcs {
             for e in s.pe.records(j) {
                 if e.ts == TOMB {
                     continue;
                 }
-                let (idx, inserted) = pmap.get_or_insert(e.person, persons.len() as u32);
-                if inserted {
-                    persons.push(e.person);
-                    cursor.push(0);
-                }
+                let (idx, inserted) = pmap.get_or_insert(e.person, np as u32);
                 unsafe {
-                    *cursor.get_unchecked_mut(idx as usize) += 1;
-                    push_local(local, idx);
+                    *pp.add(np) = e.person;
+                    *cp.add(np) = 0;
+                    np += inserted as usize;
+                    *cp.add(idx as usize) += 1;
+                    *lp.add(nrow) = idx;
+                    if keep {
+                        *tp.add(nrow) = (e.ts as u64) << 32 | e.pc as u64;
+                    }
+                    nrow += 1;
                 }
             }
+        }
+        unsafe {
+            persons.set_len(np);
+            cursor.set_len(np);
+            local.set_len(nrow);
         }
         let total = starts_of(cursor, ev_start);
         evs.clear();
         evs.reserve(total);
         unsafe { evs.set_len(total) };
-        let mut k = 0usize;
-        for s in srcs {
-            for e in s.pe.records(j) {
-                if e.ts == TOMB {
-                    continue;
-                }
+        if keep {
+            let (cp, lp, ep) = (cursor.as_mut_ptr(), local.as_ptr(), evs.as_mut_ptr());
+            for k in 0..nrow {
                 unsafe {
-                    let c = cursor.get_unchecked_mut(*local.get_unchecked(k) as usize);
-                    k += 1;
-                    *evs.get_unchecked_mut(*c as usize) = (e.ts as u64) << 32 | e.pc as u64;
+                    let c = cp.add(*lp.add(k) as usize);
+                    *ep.add(*c as usize) = *tp.add(k);
                     *c += 1;
+                }
+            }
+        } else {
+            let mut k = 0usize;
+            for s in srcs {
+                for e in s.pe.records(j) {
+                    if e.ts == TOMB {
+                        continue;
+                    }
+                    unsafe {
+                        let c = cursor.get_unchecked_mut(*local.get_unchecked(k) as usize);
+                        k += 1;
+                        *evs.get_unchecked_mut(*c as usize) = (e.ts as u64) << 32 | e.pc as u64;
+                        *c += 1;
+                    }
                 }
             }
         }
@@ -1235,7 +1269,11 @@ pub fn run() -> bool {
     let per_part: usize = env("PER_PART", "49152").parse().unwrap();
     crate::scatter2::NT.store(env("SCATTER_NT", "1") == "1", Ordering::Relaxed);
     crate::scatter2::DIRECT.store(env("SCAT", "") == "direct", Ordering::Relaxed);
-    let p2_bits = bits_for(est_events, per_part, 10.min(29 - tbits));
+    let per_part1: usize = env("PER_PART1", &per_part.to_string()).parse().unwrap();
+    let per_part2: usize = env("PER_PART2", &per_part.to_string()).parse().unwrap();
+    crate::tok::BATCH_RT.store(env("BATCH", "16384").parse::<usize>().unwrap().clamp(1024, 16384), Ordering::Relaxed);
+    D1TMP.store(env("D1TMP", "0") == "1", Ordering::Relaxed);
+    let p2_bits = bits_for(est_events, per_part2, 10.min(29 - tbits));
     let ctx = Ctx {
         ws_s: ws / 1000,
         ws,
@@ -1268,7 +1306,7 @@ pub fn run() -> bool {
         camp_slow,
         campaign_ids,
         channels,
-        p1_bits: bits_for(est_events, per_part, 12),
+        p1_bits: bits_for(est_events, per_part1, 12),
         p2_bits,
         idx_bits: 32 - tbits - p2_bits,
         fast_ts: FastTs::new(ws - REACH - 10 * DAY, we + 10 * DAY),

@@ -30,6 +30,8 @@ const BATCH: usize = 16 << 10;
 /// Bytes after a field's end and before its start that callers may read.
 pub const PAD: usize = 64;
 const BAD: u32 = 1 << 31;
+/// Input bytes per batch of `Scanner` (at most BATCH; an experiment knob).
+pub static BATCH_RT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(BATCH);
 
 /// Separator, quote and newline masks of the 64 bytes at `p`.
 #[inline(always)]
@@ -239,9 +241,10 @@ impl Scanner {
         let idx = self.idx.as_mut_ptr();
         let flg = self.flg.as_mut_ptr();
         const B01: u64 = 0x0101_0101_0101_0101;
+        let batch = BATCH_RT.load(std::sync::atomic::Ordering::Relaxed);
         let mut pos = s;
         while pos < e {
-            let lim = (pos + BATCH).min(e);
+            let lim = (pos + batch).min(e);
             // idx[0] is the (virtual) separator before the batch; idx[j] the j-th separator,
             // flg[j - 1] its flags.
             *idx = (pos as u32).wrapping_sub(1);
