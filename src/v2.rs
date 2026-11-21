@@ -420,7 +420,8 @@ unsafe fn convert_event(ctx: &Ctx, p: *const u8, s: &[u32; 7], e: &[u32; 7]) -> 
                 None => break 'valid None,
             }
         }
-        if ingest_ms.saturating_sub(ts) > LATE {
+        // ts is inside the window and ingest_ms within i32 seconds of its start: no overflow.
+        if ingest_ms - ts > LATE {
             break 'valid None;
         }
         if purchase {
