@@ -22,6 +22,63 @@ pub enum Col<'a> {
     OptStr { present: &'a [bool], bytes: &'a [u8], ends: &'a [u32] },
     Date(&'a [i32]),
     I64(&'a [i64]),
+    /// A column the caller encodes straight into the file: `size(start, end)`
+    /// is the exact byte size of rows [start, end)'s PLAIN page body (for an
+    /// optional column: definition levels, see `def_levels`, then values) and
+    /// `fill(start, end, out)` appends exactly that.
+    Gen { kind: Kind, size: &'a dyn Fn(usize, usize) -> usize, fill: &'a dyn Fn(usize, usize, &mut Vec<u8>) },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Kind {
+    Str,
+    OptStr,
+    Date,
+    I64,
+}
+
+/// Byte size of `def_levels` for `n` rows.
+pub fn def_levels_size(n: usize) -> usize {
+    if n == 0 {
+        return 4;
+    }
+    let g = n.div_ceil(8) as u64;
+    let v = (g << 1) | 1;
+    4 + (64 - v.leading_zeros() as usize).div_ceil(7) + g as usize
+}
+
+/// Definition levels (bit width 1) of `n` rows, `present(i)` for row i of
+/// them: a 4-byte length, then one bit-packed run.
+pub fn def_levels(n: usize, present: impl Fn(usize) -> bool, out: &mut Vec<u8>) {
+    if n == 0 {
+        out.extend_from_slice(&0u32.to_le_bytes());
+        return;
+    }
+    let groups8 = n.div_ceil(8);
+    let mut header = T::new();
+    header.varint(((groups8 as u64) << 1) | 1);
+    out.extend_from_slice(&((header.out.len() + groups8) as u32).to_le_bytes());
+    out.extend_from_slice(&header.out);
+    for g in 0..groups8 {
+        let mut byte = 0u8;
+        for b in 0..8 {
+            let r = g * 8 + b;
+            if r < n && present(r) {
+                byte |= 1 << b;
+            }
+        }
+        out.push(byte);
+    }
+}
+
+fn kind_of(c: &Col) -> Kind {
+    match c {
+        Col::Str { .. } => Kind::Str,
+        Col::OptStr { .. } => Kind::OptStr,
+        Col::Date(_) => Kind::Date,
+        Col::I64(_) => Kind::I64,
+        Col::Gen { kind, .. } => *kind,
+    }
 }
 
 pub struct Column<'a> {
@@ -140,8 +197,33 @@ pub fn write(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()> {
         Col::OptStr { present, .. } => present.len(),
         Col::Date(v) => v.len(),
         Col::I64(v) => v.len(),
+        Col::Gen { .. } => panic!("the first column must give the row count"),
     };
-    let mut buf: Vec<u8> = Vec::with_capacity(rows * 64 + 1024);
+    write_rows(path, rows, cols)
+}
+
+/// Writes one Parquet file of `rows` rows with the given columns.
+pub fn write_rows(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::io::Result<()> {
+    // The file's size (headers and footer roughly), so the buffer never grows.
+    let mut est = 1024 + cols.len() * 96 * rows.div_ceil(ROW_GROUP).max(1);
+    for c in cols {
+        est += match &c.data {
+            Col::Gen { size, .. } => {
+                let (mut t, mut s) = (0, 0);
+                while s < rows {
+                    let e = (s + ROW_GROUP).min(rows);
+                    t += size(s, e);
+                    s = e;
+                }
+                t
+            }
+            Col::Str { bytes, ends } => bytes.len() + 4 * ends.len(),
+            Col::OptStr { present, bytes, ends } => bytes.len() + 4 * ends.len() + present.len() / 8 + 16,
+            Col::Date(v) => 4 * v.len(),
+            Col::I64(v) => 8 * v.len(),
+        };
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(est);
     buf.extend_from_slice(b"PAR1");
     let mut groups: Vec<(usize, Vec<ChunkMeta>)> = Vec::new();
     // Per optional column: how many present values precede each row group.
@@ -152,6 +234,27 @@ pub fn write(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()> {
         let n = end - start;
         let mut chunks = Vec::new();
         for (ci, c) in cols.iter().enumerate() {
+            if let Col::Gen { kind, size, fill } = &c.data {
+                let body = size(start, end);
+                let offset = buf.len();
+                buf.extend_from_slice(&page_header(n, body, *kind == Kind::OptStr));
+                let at = buf.len();
+                fill(start, end, &mut buf);
+                assert_eq!(buf.len() - at, body, "column {} size", c.name);
+                let ty = match kind {
+                    Kind::Str | Kind::OptStr => BYTE_ARRAY,
+                    Kind::Date => INT32,
+                    Kind::I64 => INT64,
+                };
+                chunks.push(ChunkMeta {
+                    ty,
+                    name: c.name.to_string(),
+                    num_values: n as i64,
+                    offset: offset as i64,
+                    size: (buf.len() - offset) as i64,
+                });
+                continue;
+            }
             let mut body = Vec::new();
             let (ty, optional) = match &c.data {
                 Col::Str { bytes, ends } => {
@@ -200,6 +303,7 @@ pub fn write(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()> {
                     }
                     (INT64, false)
                 }
+                Col::Gen { .. } => unreachable!(),
             };
             let offset = buf.len();
             buf.extend_from_slice(&page_header(n, body.len(), optional));
@@ -226,11 +330,11 @@ pub fn write(path: &std::path::Path, cols: &[Column]) -> std::io::Result<()> {
     t.end();
     for c in cols {
         t.elem_begin();
-        let (ty, rep, conv) = match c.data {
-            Col::Str { .. } => (BYTE_ARRAY, 0, Some(UTF8)),
-            Col::OptStr { .. } => (BYTE_ARRAY, 1, Some(UTF8)),
-            Col::Date(_) => (INT32, 0, Some(DATE)),
-            Col::I64(_) => (INT64, 0, None),
+        let (ty, rep, conv) = match kind_of(&c.data) {
+            Kind::Str => (BYTE_ARRAY, 0, Some(UTF8)),
+            Kind::OptStr => (BYTE_ARRAY, 1, Some(UTF8)),
+            Kind::Date => (INT32, 0, Some(DATE)),
+            Kind::I64 => (INT64, 0, None),
         };
         t.i32(1, ty);
         t.i32(3, rep);

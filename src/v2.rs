@@ -491,51 +491,103 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
 // ---------------------------------------------------------------- dedup
 
 struct BState {
-    counts: Vec<u8>,
+    bits: Vec<u64>,
     cand: Vec<Dd>,
+    /// Exact table over the candidates: id (0: empty) and its best (ingest, loc).
+    keys: Vec<u64>,
+    best: Vec<(i32, u32)>,
 }
 
 /// Raw base pointers of every (thread, person partition) event buffer.
 struct Bases(Vec<Vec<*mut PEv>>);
 unsafe impl Sync for Bases {}
 
+/// A multiplicative hash's top bits: independent of `part`, which fixes the
+/// top bits of mix(id) within a dedup partition.
+#[inline(always)]
+fn dd_hash(id: u64, shift: u32) -> usize {
+    (id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
+}
+
 #[inline(never)]
 fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p2: u32, ib: u32, st: &mut BState) {
     let n: usize = a.iter().map(|s| s.dd.len(j)).sum();
-    let cap = (n * 8).max(64).next_power_of_two();
-    let mask = cap - 1;
-    st.counts.clear();
-    st.counts.resize(cap, 0);
+    if n < 2 {
+        return;
+    }
+    // Pass 1: a 2-bit filter (bit 0: seen, bit 1: seen again), ~8 slots per record.
+    let slots = (n * 8).max(1 << 10).next_power_of_two();
+    let shift = 64 - slots.trailing_zeros();
+    st.bits.clear();
+    st.bits.resize(slots / 32, 0);
+    let bits = &mut st.bits[..];
     for s in a {
         for r in s.dd.records(j) {
-            let c = unsafe { st.counts.get_unchecked_mut(mix(r.id) as usize & mask) };
-            *c = c.saturating_add(1);
+            let h = dd_hash(r.id, shift);
+            let w = unsafe { bits.get_unchecked_mut(h >> 5) };
+            let b = (h & 31) * 2;
+            let seen = (*w >> b) & 1;
+            *w |= (1 | (seen << 1)) << b;
         }
     }
+    // Pass 2: every copy of an id whose slot was hit twice (the duplicates
+    // plus a few hash collisions), appended branch-free.
     st.cand.clear();
+    st.cand.reserve(n);
+    let cand = st.cand.as_mut_ptr();
+    let mut nc = 0usize;
     for s in a {
         for r in s.dd.records(j) {
-            if unsafe { *st.counts.get_unchecked(mix(r.id) as usize & mask) } > 1 {
-                st.cand.push(*r);
-            }
+            let h = dd_hash(r.id, shift);
+            let dup = unsafe { (*bits.get_unchecked(h >> 5) >> ((h & 31) * 2 + 1)) & 1 };
+            unsafe { cand.add(nc).write(*r) };
+            nc += dup as usize;
         }
     }
-    st.cand.sort_unstable_by(|x, y| x.id.cmp(&y.id).then(x.ingest.cmp(&y.ingest)));
-    let c = &st.cand;
-    let mut i = 0;
-    while i < c.len() {
-        let mut k = i + 1;
-        while k < c.len() && c[k].id == c[i].id {
-            let loc = c[k].loc;
-            if loc != NONE {
-                let t = (loc >> (p2 + ib)) as usize;
-                let pp = ((loc >> ib) & ((1 << p2) - 1)) as usize;
-                let idx = (loc & ((1 << ib) - 1)) as usize;
-                unsafe { (*bases.0[t][pp].add(idx)).ts = TOMB };
-            }
-            k += 1;
+    unsafe { st.cand.set_len(nc) };
+    if nc == 0 {
+        return;
+    }
+    // Exact pass: per id keep the copy with the smallest ingest (equal ingest:
+    // identical copies, either will do) and tombstone every other copy.
+    let cap = (nc * 2).max(16).next_power_of_two();
+    st.keys.clear();
+    st.keys.resize(cap, 0);
+    if st.best.len() < cap {
+        st.best.resize(cap, (0, 0));
+    }
+    let tomb = |loc: u32| {
+        if loc != NONE {
+            let t = (loc >> (p2 + ib)) as usize;
+            let pp = ((loc >> ib) & ((1 << p2) - 1)) as usize;
+            let idx = (loc & ((1 << ib) - 1)) as usize;
+            unsafe { (*bases.0[t][pp].add(idx)).ts = TOMB };
         }
-        i = k;
+    };
+    let (keys, best) = (&mut st.keys[..], &mut st.best[..]);
+    for r in &st.cand {
+        // Keys are never 0 (packed IDs are non-empty, interned ones have the top bit).
+        // mix's low bits: unrelated to both the partition and the filter slot.
+        let mut i = mix(r.id) as usize & (cap - 1);
+        loop {
+            let k = keys[i];
+            if k == r.id {
+                let b = &mut best[i];
+                if r.ingest < b.0 {
+                    tomb(b.1);
+                    *b = (r.ingest, r.loc);
+                } else {
+                    tomb(r.loc);
+                }
+                break;
+            }
+            if k == 0 {
+                keys[i] = r.id;
+                best[i] = (r.ingest, r.loc);
+                break;
+            }
+            i = (i + 1) & (cap - 1);
+        }
     }
 }
 
@@ -1247,7 +1299,7 @@ pub fn run() -> bool {
         let a = &a_states;
         let bases = &bases;
         let (p2b, ib) = (ctx.p2_bits, ctx.idx_bits);
-        let mut b_states: Vec<BState> = (0..threads).map(|_| BState { counts: Vec::new(), cand: Vec::new() }).collect();
+        let mut b_states: Vec<BState> = (0..threads).map(|_| BState { bits: Vec::new(), cand: Vec::new(), keys: Vec::new(), best: Vec::new() }).collect();
         run_jobs(&mut b_states, p1, |st, j| dedup_partition(a, j, bases, p2b, ib, st));
     }
     log!(t0, "dedup");
@@ -1314,11 +1366,54 @@ pub fn run() -> bool {
 
     write_outputs(&out_dir, &ctx, &c_states);
     log!(t0, "done");
+    {
+        // The process exits right after: freeing these piecemeal only costs time.
+        std::mem::forget((a_states, m_states, c_states, rd, links, bases));
+        std::mem::forget((event_maps, click_maps, link_maps, ctx));
+    }
     true
 }
 
+/// Byte length of the ID behind key `k`.
+#[inline(always)]
+fn key_len(k: u64) -> usize {
+    if k & keys::INTERN_BIT != 0 {
+        let mut v = Vec::new();
+        key_bytes(k, &mut v);
+        return v.len();
+    }
+    // Seven bits a byte, first byte highest, every byte non-zero, zero-padded.
+    9 - (k.trailing_zeros() as usize) / 7
+}
+
+/// Appends the ID behind `k` as a PLAIN byte array (u32 length, bytes);
+/// `out` must have 16 bytes of spare capacity beyond it.
+#[inline(always)]
+fn put_key(k: u64, out: &mut Vec<u8>) {
+    if k & keys::INTERN_BIT != 0 {
+        let at = out.len();
+        out.extend_from_slice(&[0; 4]);
+        key_bytes(k, out);
+        let n = (out.len() - at - 4) as u32;
+        out[at..at + 4].copy_from_slice(&n.to_le_bytes());
+        return;
+    }
+    let n = key_len(k);
+    assert!(out.capacity() - out.len() >= 13 + 4);
+    unsafe {
+        use std::arch::x86_64::_pdep_u64;
+        let p = out.as_mut_ptr().add(out.len());
+        (p as *mut u32).write_unaligned(n as u32);
+        // Bytes 0..8 from the top 56 bits, byte 8 from the low 7.
+        let hi = _pdep_u64(k >> 7, 0x7F7F_7F7F_7F7F_7F7F).swap_bytes();
+        (p.add(4) as *mut u64).write_unaligned(hi);
+        *p.add(12) = (k & 0x7F) as u8;
+        out.set_len(out.len() + 4 + n);
+    }
+}
+
 fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
-    use crate::pq::{write, Col, Column};
+    use crate::pq::{def_levels, def_levels_size, write, write_rows, Col, Column, Kind};
     let user_dir = out_dir.join("user_daily");
     let camp_dir = out_dir.join("campaign_daily");
     std::fs::create_dir_all(&user_dir).expect("user_daily dir");
@@ -1340,34 +1435,57 @@ fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
         for (t, s) in c_states.iter().enumerate() {
             let path = user_dir.join(format!("part-{:05}.parquet", t));
             sc.spawn(move || {
-                let rows = &s.rows;
-                let mut ids = Vec::with_capacity(rows.len() * 10);
-                let mut id_ends = Vec::with_capacity(rows.len());
-                let mut cats = Vec::new();
-                let mut cat_ends = Vec::new();
-                let mut present = Vec::with_capacity(rows.len());
-                for r in rows {
-                    key_bytes(r.person, &mut ids);
-                    id_ends.push(ids.len() as u32);
-                    present.push(r.top != u32::MAX);
-                    if r.top != u32::MAX {
-                        cats.extend_from_slice(&ctx.categories[r.top as usize]);
-                        cat_ends.push(cats.len() as u32);
+                // Every column is encoded straight from the rows into the file buffer.
+                let rows = &s.rows[..];
+                let cats = &ctx.categories;
+                let top = |r: &UserRow| (r.top != u32::MAX).then(|| &cats[r.top as usize][..]);
+                let id_size = |a: usize, b: usize| rows[a..b].iter().map(|r| 4 + key_len(r.person)).sum::<usize>();
+                let id_fill = |a: usize, b: usize, out: &mut Vec<u8>| {
+                    out.reserve(id_size(a, b) + 16);
+                    for r in &rows[a..b] {
+                        put_key(r.person, out);
                     }
-                }
-                let day: Vec<i32> = rows.iter().map(|r| r.day).collect();
-                let sessions: Vec<i64> = rows.iter().map(|r| r.sessions as i64).collect();
-                let events: Vec<i64> = rows.iter().map(|r| r.events as i64).collect();
-                let revenue: Vec<i64> = rows.iter().map(|r| r.revenue as i64).collect();
-                write(
+                };
+                let i64_size = |a: usize, b: usize| (b - a) * 8;
+                let i64_col = |f: fn(&UserRow) -> i64| {
+                    move |a: usize, b: usize, out: &mut Vec<u8>| {
+                        for r in &rows[a..b] {
+                            out.extend_from_slice(&f(r).to_le_bytes());
+                        }
+                    }
+                };
+                let day_size = |a: usize, b: usize| (b - a) * 4;
+                let day_fill = |a: usize, b: usize, out: &mut Vec<u8>| {
+                    for r in &rows[a..b] {
+                        out.extend_from_slice(&r.day.to_le_bytes());
+                    }
+                };
+                let (ses, evs, rev) = (
+                    i64_col(|r| r.sessions as i64),
+                    i64_col(|r| r.events as i64),
+                    i64_col(|r| r.revenue as i64),
+                );
+                let cat_size = |a: usize, b: usize| {
+                    def_levels_size(b - a) + rows[a..b].iter().filter_map(top).map(|c| 4 + c.len()).sum::<usize>()
+                };
+                let cat_fill = |a: usize, b: usize, out: &mut Vec<u8>| {
+                    let rs = &rows[a..b];
+                    def_levels(rs.len(), |i| rs[i].top != u32::MAX, out);
+                    for c in rs.iter().filter_map(top) {
+                        out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                        out.extend_from_slice(c);
+                    }
+                };
+                write_rows(
                     &path,
+                    rows.len(),
                     &[
-                        Column { name: "user_id", data: Col::Str { bytes: &ids, ends: &id_ends } },
-                        Column { name: "day", data: Col::Date(&day) },
-                        Column { name: "sessions", data: Col::I64(&sessions) },
-                        Column { name: "events", data: Col::I64(&events) },
-                        Column { name: "revenue_cents", data: Col::I64(&revenue) },
-                        Column { name: "top_category", data: Col::OptStr { present: &present, bytes: &cats, ends: &cat_ends } },
+                        Column { name: "user_id", data: Col::Gen { kind: Kind::Str, size: &id_size, fill: &id_fill } },
+                        Column { name: "day", data: Col::Gen { kind: Kind::Date, size: &day_size, fill: &day_fill } },
+                        Column { name: "sessions", data: Col::Gen { kind: Kind::I64, size: &i64_size, fill: &ses } },
+                        Column { name: "events", data: Col::Gen { kind: Kind::I64, size: &i64_size, fill: &evs } },
+                        Column { name: "revenue_cents", data: Col::Gen { kind: Kind::I64, size: &i64_size, fill: &rev } },
+                        Column { name: "top_category", data: Col::Gen { kind: Kind::OptStr, size: &cat_size, fill: &cat_fill } },
                     ],
                 )
                 .expect("write user_daily");
