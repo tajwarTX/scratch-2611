@@ -99,6 +99,8 @@ struct UserRow {
 }
 
 struct Ctx {
+    /// The window start in whole seconds.
+    ws_s: i64,
     ws: i64,
     we: i64,
     base: i64,
@@ -154,9 +156,12 @@ impl Ctx {
     }
 }
 
+/// The partition of a key: the top bits of one multiplication (every key
+/// bit reaches them). Tables inside a partition index with `mix`, which is
+/// independent of this.
 #[inline(always)]
 fn part(k: u64, bits: u32) -> usize {
-    (mix(k) >> (64 - bits)) as usize
+    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
 }
 
 // ---------------------------------------------------------------- links
@@ -309,7 +314,17 @@ const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 /// A key for the `n` bytes at `p` (16 readable).
 #[inline(always)]
 unsafe fn key_at(p: *const u8, n: usize) -> u64 {
-    match fast::pack(p, n) {
+    if n == 9 {
+        // The usual ID length, in a dozen instructions (same value as `pack9`).
+        const M7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+        let v = (p as *const u64).read_unaligned();
+        let c = *p.add(8) as u64;
+        let u = (v & M7).wrapping_add(M7);
+        if ((!u | v) & 0x8080_8080_8080_8080 == 0) & (c.wrapping_sub(1) < 0x7F) {
+            return (std::arch::x86_64::_pext_u64(v.swap_bytes(), M7) << 7) | c;
+        }
+    }
+    match fast::pack9(p, n) {
         Some(k) => k,
         None => keys::intern(std::slice::from_raw_parts(p, n)),
     }
@@ -320,6 +335,11 @@ unsafe fn key_at(p: *const u8, n: usize) -> u64 {
 unsafe fn ts_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i64> {
     if (1..=16).contains(&n) {
         return fast::digits16(p.add(n), n).map(|v| v as i64);
+    }
+    if n == 20 {
+        if let Some(s) = ctx.fast_ts.f1_fast(p) {
+            return Some(s * 1000);
+        }
     }
     if n == 20 || n == 25 {
         if let Some(s) = ctx.fast_ts.dt_secs_simd(p, n) {
@@ -333,8 +353,11 @@ unsafe fn ts_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i64> {
 /// a whole second within i32 range (the fast pipeline then gives up).
 #[inline(always)]
 unsafe fn ingest_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i32> {
-    let ws_s = ctx.ws / 1000;
+    let ws_s = ctx.ws_s;
     if n == 20 {
+        if let Some(s) = ctx.fast_ts.f1_fast(p) {
+            return i32::try_from(s - ws_s).ok();
+        }
         if let Some(s) = ctx.fast_ts.dt_secs_simd(p, n) {
             return i32::try_from(s - ws_s).ok();
         }
@@ -406,7 +429,8 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
     let loc_hi = st.tid << (p2 + ib);
     let idx_max = (1usize << ib) - 2;
     let AState { pe, dd, sc, bad, .. } = st;
-    tok::scan_file::<7>(sc, file, start, end, |p, s, e| unsafe {
+    tok::scan_file::<7>(sc, file, start, end, #[inline(always)]
+    |p, s, e| unsafe {
         let Some(o) = convert_event(ctx, p, s, e) else { return };
         let ingest = o.ingest.unwrap_or_else(|| {
             *bad = true;
@@ -512,15 +536,16 @@ struct BState {
 struct Bases(Vec<Vec<*mut PEv>>);
 unsafe impl Sync for Bases {}
 
-/// A multiplicative hash's top bits: independent of `part`, which fixes the
-/// top bits of mix(id) within a dedup partition.
+/// The filter slot of an id: the bits of `part`'s product just below the
+/// ones that chose the partition (`skip` of them), so they still vary freely
+/// inside it.
 #[inline(always)]
-fn dd_hash(id: u64, shift: u32) -> usize {
-    (id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
+fn dd_hash(id: u64, skip: u32, shift: u32) -> usize {
+    ((id.wrapping_mul(0x9E37_79B9_7F4A_7C15) << skip) >> shift) as usize
 }
 
 #[inline(never)]
-fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p2: u32, ib: u32, st: &mut BState) {
+fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p1: u32, p2: u32, ib: u32, st: &mut BState) {
     let n: usize = a.iter().map(|s| s.dd.len(j)).sum();
     if n < 2 {
         return;
@@ -533,7 +558,7 @@ fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p2: u32, ib: u32, st: 
     let bits = &mut st.bits[..];
     for s in a {
         for r in s.dd.records(j) {
-            let h = dd_hash(r.id, shift);
+            let h = dd_hash(r.id, p1, shift);
             let w = unsafe { bits.get_unchecked_mut(h >> 5) };
             let b = (h & 31) * 2;
             let seen = (*w >> b) & 1;
@@ -548,7 +573,7 @@ fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p2: u32, ib: u32, st: 
     let mut nc = 0usize;
     for s in a {
         for r in s.dd.records(j) {
-            let h = dd_hash(r.id, shift);
+            let h = dd_hash(r.id, p1, shift);
             let dup = unsafe { (*bits.get_unchecked(h >> 5) >> ((h & 31) * 2 + 1)) & 1 };
             unsafe { cand.add(nc).write(*r) };
             nc += dup as usize;
@@ -1202,6 +1227,7 @@ pub fn run() -> bool {
     crate::scatter2::NT.store(env("SCATTER_NT", "1") == "1", Ordering::Relaxed);
     let p2_bits = bits_for(est_events, per_part, 10.min(29 - tbits));
     let ctx = Ctx {
+        ws_s: ws / 1000,
         ws,
         we,
         base,
@@ -1336,9 +1362,9 @@ pub fn run() -> bool {
     {
         let a = &a_states;
         let bases = &bases;
-        let (p2b, ib) = (ctx.p2_bits, ctx.idx_bits);
+        let (p1b, p2b, ib) = (ctx.p1_bits, ctx.p2_bits, ctx.idx_bits);
         let mut b_states: Vec<BState> = (0..threads).map(|_| BState { bits: Vec::new(), cand: Vec::new(), keys: Vec::new(), best: Vec::new() }).collect();
-        run_jobs(&mut b_states, p1, |st, j| dedup_partition(a, j, bases, p2b, ib, st));
+        run_jobs(&mut b_states, p1, |st, j| dedup_partition(a, j, bases, p1b, p2b, ib, st));
     }
     log!(t0, "dedup");
 

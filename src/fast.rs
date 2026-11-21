@@ -265,6 +265,32 @@ pub fn pack(p: *const u8, len: usize) -> Option<u64> {
     }
 }
 
+/// `pack` in fewer instructions (same results for every `len`).
+#[inline(always)]
+pub fn pack9(p: *const u8, len: usize) -> Option<u64> {
+    const M7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const LO: u64 = 0x0101_0101_0101_0101;
+    if len > 9 {
+        return None;
+    }
+    unsafe {
+        let w = (p as *const u64).read_unaligned();
+        let n8 = 8 * len.min(8) as u32;
+        let v = _bzhi_u64(w, n8);
+        let is9 = (len == 9) as u64;
+        let c = (*p.add(8) as u64) & is9.wrapping_neg();
+        // Bytes of the first 8 in use must be 1..=0x7F: fill the others with 1.
+        let t = v | (_bzhi_u64(LO, n8) ^ LO);
+        let u = (t & M7).wrapping_add(M7);
+        let bad = ((!u | t) & HI) | (is9 & (c.wrapping_sub(1) >= 0x7F) as u64);
+        if bad != 0 {
+            return None;
+        }
+        Some((_pext_u64(v.swap_bytes(), M7) << 7) | c)
+    }
+}
+
 /// Value of an all-ASCII-digit string of length 1..=16 ending at `end`
 /// (16 bytes before `end` are readable), or None if any byte is not a digit.
 #[inline(always)]
@@ -389,6 +415,7 @@ mod tests {
             buf[32..32 + n].copy_from_slice(&w);
             buf[32 + n] = alphabet[(r % 13) as usize];
             assert_eq!(pack(buf[32..].as_ptr(), n), keys::pack(&w), "{:?}", w);
+            assert_eq!(pack9(buf[32..].as_ptr(), n), keys::pack(&w), "pack9 {:?}", w);
         }
         // Packed order is byte order.
         let mut words: Vec<Vec<u8>> = Vec::new();

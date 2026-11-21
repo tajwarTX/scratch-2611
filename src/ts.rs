@@ -166,7 +166,17 @@ pub struct FastTs {
     count: usize,
     /// The prefixes again, indexed by (last year digit, month) for `dt_secs`.
     by_ym: Vec<(u64, i64, u32, u32)>,
+    /// For `f1_fast`: by the 9 bits of a `YYYY-MM-` word that tell the
+    /// covered months apart (last year digit, month), the whole word, the
+    /// epoch second before the month's first day, the first covered day of
+    /// the month and how many more follow.
+    f1tab: Vec<(u64, i64, u32, u32)>,
 }
+
+/// The bits of a `YYYY-MM-` word (little-endian) that index `f1tab`: the low
+/// nibble of the last year digit, bit 0 of the month's tens, the low nibble
+/// of its ones.
+const F1_BITS: u64 = (0xF << 24) | (1 << 40) | (0xF << 48);
 
 /// `dt_secs`'s table slot for a `YYYY-MM-` word.
 #[inline(always)]
@@ -201,7 +211,14 @@ impl FastTs {
         for &e in &prefixes[..count] {
             by_ym[ym_slot(e.0)] = e;
         }
-        FastTs { prefixes, count, by_ym }
+        let mut f1tab = vec![(0u64, 0i64, 1u32, 0u32); 512];
+        for &e in &prefixes[..count] {
+            let slot = unsafe { std::arch::x86_64::_pext_u64(e.0, F1_BITS) } as usize;
+            // Two covered months never share a slot (they are at most weeks apart).
+            assert!(f1tab[slot].0 == 0);
+            f1tab[slot] = (e.0, (e.1 - 1) * 86_400, e.2, e.3 - e.2);
+        }
+        FastTs { prefixes, count, by_ym, f1tab }
     }
 
     /// F1 with word-at-a-time checks; None means "not handled here" (the
@@ -243,6 +260,37 @@ impl FastTs {
             }
         }
         None
+    }
+
+    /// Epoch seconds of the F1 value in the 20 bytes at `p`, in few
+    /// instructions; None means "not handled here" (other month, or not a
+    /// valid F1), and the caller uses the exact general path.
+    ///
+    /// The `YYYY-MM-` word must equal a covered month's (so year and month
+    /// are exact); bytes 8..20 minus a template must be within per-byte
+    /// limits (digits in range, `T`, `:`, `:`, `Z` exact); the day must be
+    /// in the month's covered span and the hour at most 23.
+    #[inline(always)]
+    pub unsafe fn f1_fast(&self, p: *const u8) -> Option<i64> {
+        use std::arch::x86_64::*;
+        let key = (p as *const u64).read_unaligned();
+        let ent = &*self.f1tab.as_ptr().add(_pext_u64(key, F1_BITS) as usize);
+        let v = _mm_loadu_si128(p.add(4) as *const __m128i); // bytes 4..20
+        let z = b'0' as i8;
+        let t = _mm_sub_epi8(v, _mm_setr_epi8(0, 0, 0, 0, z, z, b'T' as i8, z, z, b':' as i8, z, z, b':' as i8, z, z, b'Z' as i8));
+        let over = _mm_subs_epu8(t, _mm_setr_epi8(-1, -1, -1, -1, 3, 9, 0, 2, 9, 0, 5, 9, 0, 5, 9, 0));
+        // Digit pairs DD, HH, MM, SS as words.
+        let d = _mm_shuffle_epi8(t, _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+        let w = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
+        let late = _mm_cmpgt_epi16(w, _mm_setr_epi16(i16::MAX, 23, i16::MAX, i16::MAX, i16::MAX, i16::MAX, i16::MAX, i16::MAX));
+        let bad = _mm_or_si128(over, late);
+        // [3600 * HH, 60 * MM + SS]
+        let sod = _mm_cvtsi128_si64(_mm_madd_epi16(w, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0))) as u64;
+        let dd = _mm_cvtsi128_si32(w) as u32 & 0xFFFF;
+        if (_mm_testz_si128(bad, bad) == 0) | (ent.0 != key) | (dd.wrapping_sub(ent.2) > ent.3) {
+            return None;
+        }
+        Some(ent.1 + dd as i64 * 86_400 + (sod as u32 as i64) + (sod >> 32) as i64)
     }
 
     /// `dt_secs` with one 32-byte AVX2 pass: digits and separators checked
@@ -445,6 +493,11 @@ mod fast_tests {
                 }
                 let mut buf = t.to_vec();
                 buf.extend_from_slice(&[0xAA; 32]);
+                if t.len() == 20 {
+                    if let Some(x) = unsafe { fast.f1_fast(buf.as_ptr()) } {
+                        assert_eq!(Some(x * 1000), parse_ts(t), "f1_fast {:?}", String::from_utf8_lossy(t));
+                    }
+                }
                 let a = unsafe { fast.dt_secs(buf.as_ptr(), t.len()) };
                 let b = unsafe { fast.dt_secs_simd(buf.as_ptr(), t.len()) };
                 assert_eq!(a, b, "simd {:?}", String::from_utf8_lossy(t));
@@ -459,6 +512,7 @@ mod fast_tests {
                     assert_eq!(Some(v), parse_ts(c.as_bytes()), "swar {}", c);
                 }
             }
+            assert!(!lo.starts_with("2028") || unsafe { fast.f1_fast(b"2028-02-29T12:34:56Z...........".as_ptr()) } == parse_ts(b"2028-02-29T12:34:56Z").map(|x| x / 1000));
             assert!(!lo.starts_with("2028") || (dt(b"2028-02-29T12:34:56Z").is_some() && dt(b"2028-02-29T12:34:56+05:30").is_some()));
             let good2 = b"2028-02-29T12:34:56-09:45";
             for i in 0..25 {

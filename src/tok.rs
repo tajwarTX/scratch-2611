@@ -91,15 +91,17 @@ unsafe fn mark_bad(nl: *mut u32, n: u64, badnl: u64) {
     }
 }
 
-pub struct Scanner {
+/// The general scanner: handles every line, including ones with misplaced
+/// quotes. `Scanner` uses it for the rare batches that contain such a line.
+pub struct Scanner3 {
     st: Vec<u32>,
     en: Vec<u32>,
     nl: Vec<u32>,
 }
 
-impl Scanner {
+impl Scanner3 {
     pub fn new() -> Self {
-        Scanner { st: vec![0; BATCH + 128], en: vec![0; BATCH + 128], nl: vec![0; BATCH + 128] }
+        Scanner3 { st: vec![0; BATCH + 128], en: vec![0; BATCH + 128], nl: vec![0; BATCH + 128] }
     }
 
     /// Calls `each(starts, ends)` with the value ranges (absolute offsets,
@@ -213,6 +215,152 @@ impl Scanner {
     }
 }
 
+/// For each 8-bit set of "field is quoted" flags, the flags as 8 bytes of 0/1.
+static QTAB: [[u8; 8]; 256] = {
+    let mut t = [[0u8; 8]; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut b = 0;
+        while b < 8 {
+            t[i][b] = ((i >> b) & 1) as u8;
+            b += 1;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// Appends the low bits of `x` (all bits above the valid ones are zero) to
+/// the bit stream at bit `w`. Word `w / 64` must already be initialized; the
+/// next word is written.
+#[inline(always)]
+unsafe fn put_bits(bits: *mut u64, w: usize, x: u64) {
+    let (i, sh) = (w >> 6, (w & 63) as u32);
+    *bits.add(i) |= x << sh;
+    *bits.add(i + 1) = (x >> 1) >> (63 - sh);
+}
+
+/// 57 bits of the stream from bit `k` on.
+#[inline(always)]
+unsafe fn get_bits(bits: *const u64, k: usize) -> u64 {
+    ((bits as *const u8).add(k >> 3) as *const u64).read_unaligned() >> (k & 7)
+}
+
+/// The scanner: one pass builds, per batch, the positions of all separators
+/// and two bit streams with one bit per separator (is a newline; is preceded
+/// by a closing quote). A line is N consecutive separators of which only the
+/// last is a newline; its value ranges come from one 8-lane add/subtract.
+/// Batches with a misplaced quote anywhere go to `Scanner3` instead.
+pub struct Scanner {
+    idx: Vec<u32>,
+    nlb: Vec<u64>,
+    qtb: Vec<u64>,
+    slow: Scanner3,
+}
+
+impl Scanner {
+    pub fn new() -> Self {
+        Scanner { idx: vec![0; BATCH + 160], nlb: vec![0; BATCH / 64 + 8], qtb: vec![0; BATCH / 64 + 8], slow: Scanner3::new() }
+    }
+
+    /// Same contract as `Scanner3::scan`, for N <= 8.
+    #[inline(always)]
+    pub unsafe fn scan<const N: usize>(&mut self, data: *const u8, s: usize, e: usize, mut each: impl FnMut(&[u32; N], &[u32; N])) {
+        debug_assert!(N >= 1 && N <= 8);
+        let idx = self.idx.as_mut_ptr();
+        let nlb = self.nlb.as_mut_ptr();
+        let qtb = self.qtb.as_mut_ptr();
+        let mut pos = s;
+        while pos < e {
+            let lim = (pos + BATCH).min(e);
+            // idx[0] is the (virtual) separator before the batch; idx[j] the j-th separator.
+            *idx = (pos as u32).wrapping_sub(1);
+            let mut ws = 1usize;
+            *nlb = 0;
+            *qtb = 0;
+            let mut nbit = 0usize;
+            let (mut ps, mut pq) = (1u64 << 63, 0u64);
+            let mut cl = 0u8;
+            let mut bad_any = 0u64;
+            let mut b = pos;
+            while b < lim {
+                let (sep, q, n) = block(data, b, lim);
+                let s1 = (sep << 1) | (ps >> 63);
+                let s2 = (sep << 2) | (ps >> 62);
+                let qs = (q << 1) | (pq >> 63);
+                ps = sep;
+                pq = q;
+                let mut land = 0u64;
+                cl = _addcarry_u64(cl, !sep, q & s1, &mut land);
+                bad_any |= (qs & !(sep ^ s2)) | ((land ^ qs) & sep);
+                let cnt = sep.count_ones() as usize;
+                put_bits(nlb, nbit, _pext_u64(n, sep));
+                put_bits(qtb, nbit, _pext_u64(qs, sep));
+                nbit += cnt;
+                flatten(idx, &mut ws, sep, b as u32);
+                b += 64;
+            }
+            // Bits past the last separator read as zero.
+            *nlb.add((nbit >> 6) + 1) = 0;
+            *qtb.add((nbit >> 6) + 1) = 0;
+            // The end of the batch's complete lines.
+            let done = match memchr::memrchr(b'\n', std::slice::from_raw_parts(data.add(pos), lim - pos)) {
+                Some(x) => pos + x + 1,
+                None => pos,
+            };
+            if done == pos || bad_any != 0 {
+                // A line longer than a batch, or a misplaced quote somewhere: the general scanner.
+                let to = if done == pos {
+                    match memchr::memchr(b'\n', std::slice::from_raw_parts(data.add(pos), e - pos)) {
+                        Some(x) => pos + x + 1,
+                        None => e,
+                    }
+                } else {
+                    done
+                };
+                self.slow.scan::<N>(data, pos, to.min(e), &mut each);
+                pos = to;
+                continue;
+            }
+            let total = ws - 1;
+            let field_mask = (1u64 << N) - 1;
+            let shape = 1u64 << (N - 1);
+            let one = _mm256_set1_epi32(1);
+            let mut k = 0usize;
+            let (mut st, mut en) = ([0u32; 8], [0u32; 8]);
+            while k < total {
+                let nb = get_bits(nlb, k);
+                if nb & field_mask == shape {
+                    let qv = _mm256_cvtepu8_epi32(_mm_loadl_epi64(QTAB.as_ptr().add((get_bits(qtb, k) & field_mask) as usize) as *const __m128i));
+                    let a = _mm256_loadu_si256(idx.add(k) as *const __m256i);
+                    let bb = _mm256_loadu_si256(idx.add(k + 1) as *const __m256i);
+                    _mm256_storeu_si256(st.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(_mm256_add_epi32(a, one), qv));
+                    _mm256_storeu_si256(en.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(bb, qv));
+                    k += N;
+                    if N == 1 && *idx.add(k) == (*idx.add(k - 1)).wrapping_add(1) {
+                        continue; // an empty line
+                    }
+                    each(&*(st.as_ptr() as *const [u32; N]), &*(en.as_ptr() as *const [u32; N]));
+                } else {
+                    // Not N fields: skip past the line's newline (or to the batch's end).
+                    loop {
+                        let w = get_bits(nlb, k) & ((1u64 << 57) - 1);
+                        if w != 0 {
+                            k += w.trailing_zeros() as usize + 1;
+                            break;
+                        }
+                        k += 57;
+                        if k >= total {
+                            break;
+                        }
+                    }
+                }
+            }
+            pos = done;
+        }
+    }
+}
+
 /// Runs `scan` over `[s, e)` of a whole file: the part far from the file's
 /// end directly, the rest from a padded copy (with a `\n` added when the
 /// file does not end with one). `each` gets the line's base pointer.
@@ -234,7 +382,7 @@ pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usi
     }
     if s.max(PAD) == s && mid > s {
         let p = file.as_ptr();
-        unsafe { sc.scan::<N>(p, s, mid, |a, b| each(p, a, b)) };
+        unsafe { sc.scan::<N>(p, s, mid, #[inline(always)] |a, b| each(p, a, b)) };
     } else {
         mid = s;
     }
