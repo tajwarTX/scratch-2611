@@ -1134,7 +1134,8 @@ pub fn run() -> bool {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n: &usize| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .min(4);
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let ws = parse_ts(manifest_value(&manifest, "window_start").expect("window_start").as_bytes()).expect("ws");
