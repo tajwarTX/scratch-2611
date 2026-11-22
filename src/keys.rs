@@ -60,7 +60,26 @@ pub fn check_hash(s: &[u8]) -> u64 {
         b[..c.len()].copy_from_slice(c);
         h = (h.rotate_left(23) ^ u64::from_le_bytes(b)).wrapping_mul(0xA076_1D64_78BD_642F);
     }
-    (h ^ (h >> 31)).wrapping_mul(0xE703_7ED1_A0B4_28DB) >> 40
+    (h ^ (h >> 31)).wrapping_mul(0xE703_7ED1_A0B4_28DB) >> 48
+}
+
+/// A name word: check hash (16 bits) << 48 | length (8) << 40 | source offset (40).
+/// Two words with different top 24 bits are different strings.
+#[inline(always)]
+pub fn name_word(s: &[u8], src: u64) -> u64 {
+    if s.len() > 255 {
+        NAMES_FAIL.store(true, AtomicOrdering::Relaxed);
+    }
+    check_hash(s) << 48 | ((s.len() as u64 & 0xFF) << 40) | src
+}
+
+/// The `len` bytes at source offset `off`.
+#[inline]
+pub fn source_bytes(off: u64, len: usize) -> &'static [u8] {
+    let tab = unsafe { &*SOURCE.load(AtomicOrdering::Acquire) };
+    let off = off as usize;
+    let i = tab.bases.partition_point(|&b| b <= off) - 1;
+    unsafe { std::slice::from_raw_parts(tab.files[i].0.add(off - tab.bases[i]), len) }
 }
 
 /// The fingerprint key of an ID that does not pack.
@@ -116,7 +135,7 @@ fn name_of(key: u64) -> u64 {
         let s = &t.slots[i];
         let k = s[0].load(AtomicOrdering::Acquire);
         if k == key {
-            return s[1].load(AtomicOrdering::Acquire) & OFF_MASK;
+            return s[1].load(AtomicOrdering::Acquire);
         }
         assert!(k != 0, "a fingerprint key without a name");
         i = (i + 1) & t.mask;
@@ -412,7 +431,8 @@ impl Interner {
     #[inline(always)]
     fn bytes_of(&self, k: u64) -> &[u8] {
         if k & FP_BIT != 0 {
-            return source_slice(name_of(k));
+            let w = name_of(k);
+            return source_bytes(w & OFF_MASK, ((w >> 40) & 0xFF) as usize);
         }
         if k & SRC_BIT != 0 {
             return source_slice(k & OFF_MASK);
@@ -475,6 +495,14 @@ pub fn key_of(s: &[u8]) -> u64 {
         Some(k) => k,
         None => intern(s),
     }
+}
+
+/// Byte length of the string behind an interned key.
+pub fn interned_len(k: u64) -> usize {
+    if k & FP_BIT != 0 {
+        return ((name_of(k) >> 40) & 0xFF) as usize;
+    }
+    interned_bytes(k).len()
 }
 
 pub fn key_bytes(k: u64, out: &mut Vec<u8>) {

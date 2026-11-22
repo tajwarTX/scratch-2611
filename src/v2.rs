@@ -326,7 +326,7 @@ unsafe fn link_key(p: *const u8, n: usize, src: u64) -> u64 {
     let b = std::slice::from_raw_parts(p, n);
     let key = keys::fp_key(b);
     keys::note_nonpacked();
-    keys::name_insert(key, keys::check_hash(b) << 40 | src);
+    keys::name_insert(key, keys::name_word(b, src));
     key
 }
 
@@ -988,7 +988,7 @@ unsafe fn user_key(p: *const u8, n: usize, src: u64, lu: &mut Scatter16<Lu>, p2:
     }
     let b = std::slice::from_raw_parts(p, n);
     let key = keys::fp_key(b);
-    lu.push(part(key, p2), Lu { key, w: keys::check_hash(b) << 40 | src });
+    lu.push(part(key, p2), Lu { key, w: keys::name_word(b, src) });
     key
 }
 
@@ -1715,9 +1715,7 @@ pub fn run() -> bool {
 #[inline(always)]
 fn key_len(k: u64) -> usize {
     if k & keys::INTERN_BIT != 0 {
-        let mut v = Vec::new();
-        key_bytes(k, &mut v);
-        return v.len();
+        return keys::interned_len(k);
     }
     // Seven bits a byte, first byte highest, every byte non-zero, zero-padded.
     9 - (k.trailing_zeros() as usize) / 7
