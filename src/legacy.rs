@@ -256,17 +256,48 @@ fn build_links(maps: &[Mmap]) -> U64Map {
 }
 
 /// Runs jobs 0..njobs on one thread per state, each pulling the next job.
+/// Pins the calling thread to the `t`-th CPU this process may run on
+/// (wrapping around), so workers do not migrate between phases. Errors are
+/// ignored: pinning is only a hint. PIN=0 turns it off.
+pub(crate) fn pin(t: usize) {
+    extern "C" {
+        fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| env("PIN", "1") != "0") {
+        return;
+    }
+    let mut set = [0u64; 16];
+    unsafe {
+        if sched_getaffinity(0, 128, set.as_mut_ptr()) != 0 {
+            return;
+        }
+        let cpus: Vec<usize> = (0..1024).filter(|&c| set[c / 64] >> (c % 64) & 1 != 0).collect();
+        if cpus.is_empty() {
+            return;
+        }
+        let c = cpus[t % cpus.len()];
+        let mut one = [0u64; 16];
+        one[c / 64] = 1 << (c % 64);
+        sched_setaffinity(0, 128, one.as_ptr());
+    }
+}
+
 pub(crate) fn run_jobs<S: Send>(states: &mut [S], njobs: usize, f: impl Fn(&mut S, usize) + Sync) {
     let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
-        for st in states.iter_mut() {
+        for (t, st) in states.iter_mut().enumerate() {
             let (next, f) = (&next, &f);
-            sc.spawn(move || loop {
-                let j = next.fetch_add(1, Ordering::Relaxed);
-                if j >= njobs {
-                    break;
+            sc.spawn(move || {
+                pin(t);
+                loop {
+                    let j = next.fetch_add(1, Ordering::Relaxed);
+                    if j >= njobs {
+                        break;
+                    }
+                    f(st, j);
                 }
-                f(st, j);
             });
         }
     });

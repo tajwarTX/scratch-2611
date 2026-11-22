@@ -1349,7 +1349,14 @@ pub fn run() -> bool {
     };
     let mut a_states: Vec<AState> = if env("PALLOC", "1") == "1" {
         std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..threads).map(|t| sc.spawn(move || make(t))).collect();
+            let hs: Vec<_> = (0..threads)
+                .map(|t| {
+                    sc.spawn(move || {
+                        crate::legacy::pin(t);
+                        make(t)
+                    })
+                })
+                .collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         })
     } else {
