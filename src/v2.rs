@@ -121,6 +121,11 @@ struct Ctx {
     p2_bits: u32,
     idx_bits: u32,
     fast_ts: FastTs,
+    /// The recovered event-ID key, if any: decoded events take the indexed path.
+    ekey: Option<crate::gen::Key>,
+    /// Decoded event numbers are below 2^ibits; partition = number >> ishift.
+    ibits: u32,
+    ishift: u32,
 }
 
 impl Ctx {
@@ -305,7 +310,20 @@ fn parse_links(file: &[u8], start: usize, end: usize, links: &Links, sc: &mut Sc
 
 // ---------------------------------------------------------------- parse
 
+/// A decoded event copy, in the partition of its number's range. `ts` is
+/// TOMB for an invalid copy (it still takes part in dedup).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct IxRec {
+    user: u64,
+    v: u32,
+    ingest: i32,
+    ts: u32,
+    pc: u32,
+}
+
 struct AState {
+    ix: Scatter<IxRec, 8>,
     tid: u32,
     pe: Scatter16<PEv>,
     dd: Scatter16<Dd>,
@@ -381,6 +399,8 @@ unsafe fn ingest_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i32> {
 /// seconds in range, the fast pipeline gives up), and the event record if
 /// the copy is valid.
 struct EvOut {
+    /// The event's number (decoded ID), if it takes the indexed path.
+    v: Option<u32>,
     id: u64,
     ingest: Option<i32>,
     ev: Option<PEv>,
@@ -397,6 +417,10 @@ unsafe fn convert_event(ctx: &Ctx, p: *const u8, s: &[u32; 7], e: &[u32; 7]) -> 
         return None;
     }
     let id = key_at(at(0), ln(0));
+    let v = match ctx.ekey {
+        Some(k) => k.decode(std::slice::from_raw_parts(at(0), ln(0))).filter(|&v| v < 1u64 << ctx.ibits).map(|v| v as u32),
+        None => None,
+    };
     let ingest = ingest_at(ctx, at(3), ln(3));
     let ingest_ms = ws + ingest.unwrap_or(0) as i64 * 1000;
     let ev = 'valid: {
@@ -429,7 +453,7 @@ unsafe fn convert_event(ctx: &Ctx, p: *const u8, s: &[u32; 7], e: &[u32; 7]) -> 
         }
         Some(PEv { person: key_at(at(1), ln(1)), ts: (ts - base) as u32, pc })
     };
-    Some(EvOut { id, ingest, ev })
+    Some(EvOut { v, id, ingest, ev })
 }
 
 #[inline(never)]
@@ -437,7 +461,8 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
     let (p1, p2, ib) = (ctx.p1_bits, ctx.p2_bits, ctx.idx_bits);
     let loc_hi = st.tid << (p2 + ib);
     let idx_max = (1usize << ib) - 2;
-    let AState { pe, dd, sc, bad, .. } = st;
+    let ishift = ctx.ishift;
+    let AState { pe, dd, ix, sc, bad, .. } = st;
     tok::scan_file::<7>(sc, file, start, end, #[inline(always)]
     |p, s, e| unsafe {
         let Some(o) = convert_event(ctx, p, s, e) else { return };
@@ -445,6 +470,14 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
             *bad = true;
             0
         });
+        if let Some(v) = o.v {
+            let r = match o.ev {
+                Some(ev) => IxRec { user: ev.person, v, ingest, ts: ev.ts, pc: ev.pc },
+                None => IxRec { user: 0, v, ingest, ts: TOMB, pc: 0 },
+            };
+            ix.push((v >> ishift) as usize, r);
+            return;
+        }
         let mut loc = NONE;
         if let Some(ev) = o.ev {
             let pp = part(ev.person, p2);
@@ -456,6 +489,32 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
         }
         dd.push(part(o.id, p1), Dd { id: o.id, ingest, loc });
     });
+}
+
+/// The event-ID key under which 48 sampled IDs (a few from the start of each
+/// file) all decode below 2^bits, or None.
+fn sample_key(maps: &[Option<Mmap>], bits: u32) -> Option<crate::gen::Key> {
+    let mut samples = Vec::new();
+    for m in maps.iter().flatten() {
+        let f: &[u8] = &m[..];
+        let mut p = crate::csv::after_header(f);
+        let mut k = 0;
+        while p < f.len() && k < 4 {
+            let e = memchr::memchr(b'\n', &f[p..]).map_or(f.len(), |x| p + x);
+            let line = &f[p..e];
+            let id = line.split(|&b| b == b',').next().unwrap_or(b"");
+            let id = if id.len() >= 2 && id[0] == b'"' && id[id.len() - 1] == b'"' { &id[1..id.len() - 1] } else { id };
+            if let Some(v) = crate::gen::id_value(id) {
+                samples.push(v);
+                k += 1;
+            }
+            p = e + 1;
+        }
+        if samples.len() >= 48 {
+            break;
+        }
+    }
+    crate::gen::recover(&samples, bits)
 }
 
 /// CBENCH=1: single-thread cost of `convert_event` alone, over the largest
@@ -949,10 +1008,13 @@ fn walk_groups(st: &mut CState, from: usize, ctx: &Ctx) {
             continue;
         }
         let pe = &mut evs[es..ee];
-        if pe.len() < RADIX_MIN {
-            pe.sort_unstable();
-        } else {
-            radix_sort(pe, ev_tmp, |&e| (e >> 32) as u32);
+        // Runs of decoded events usually arrive in time order already.
+        if pe.windows(2).any(|w| (w[0] >> 32) > (w[1] >> 32)) {
+            if pe.len() < RADIX_MIN {
+                pe.sort_unstable();
+            } else {
+                radix_sort(pe, ev_tmp, |&e| (e >> 32) as u32);
+            }
         }
         let pc = &mut cks[ck_start[p] as usize..ck_start[p + 1] as usize];
         if pc.len() < RADIX_MIN {
@@ -977,14 +1039,15 @@ static D1TMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 /// the person's partition for D2. Every other ID is a person on its own and
 /// is walked here.
 #[inline(never)]
-fn process_partition(st: &mut CState, mv: &mut MState, srcs: &[AState], rd: &[Scatter16<Rd>], j: usize, ctx: &Ctx) {
+fn process_partition(st: &mut CState, mv: &mut MState, srcs: &[AState], xs: &[XState], rd: &[Scatter16<Rd>], j: usize, ctx: &Ctx) {
     let p2 = ctx.p2_bits;
     let nl;
     {
         let CState { evs, cks, ev_tmp, pmap, persons, roots, local, ev_start, ck_start, cursor, .. } = &mut *st;
         let nrd: usize = rd.iter().map(|r| r.len(j)).sum();
         let n: usize = srcs.iter().map(|s| s.pe.len(j)).sum();
-        pmap.reset(n / 16 + nrd + 64, p2);
+        let nx: usize = xs.iter().map(|x| x.runs[j].len()).sum();
+        pmap.reset(n / 16 + nx / 8 + nrd + 64, p2);
         persons.clear();
         roots.clear();
         cursor.clear();
@@ -1036,6 +1099,21 @@ fn process_partition(st: &mut CState, mv: &mut MState, srcs: &[AState], rd: &[Sc
             cursor.set_len(np);
             local.set_len(nrow);
         }
+        // Runs of decoded events: one lookup a run.
+        for x in xs {
+            let v = &x.runs[j];
+            let mut i = 0;
+            while i < v.len() {
+                let (user, cnt) = (v[i], v[i + 1] as u32);
+                let (idx, inserted) = pmap.get_or_insert(user, persons.len() as u32);
+                if inserted {
+                    persons.push(user);
+                    cursor.push(0);
+                }
+                cursor[idx as usize] += cnt;
+                i += 2 + cnt as usize;
+            }
+        }
         let total = starts_of(cursor, ev_start);
         evs.clear();
         evs.reserve(total);
@@ -1063,6 +1141,18 @@ fn process_partition(st: &mut CState, mv: &mut MState, srcs: &[AState], rd: &[Sc
                         *c += 1;
                     }
                 }
+            }
+        }
+        for x in xs {
+            let v = &x.runs[j];
+            let mut i = 0;
+            while i < v.len() {
+                let (user, cnt) = (v[i], v[i + 1] as usize);
+                let idx = pmap.get(user).unwrap() as usize;
+                let c = cursor[idx] as usize;
+                evs[c..c + cnt].copy_from_slice(&v[i + 2..i + 2 + cnt]);
+                cursor[idx] += cnt as u32;
+                i += 2 + cnt;
             }
         }
         // Clicks: those of linked IDs, and of other IDs with events here.
@@ -1122,6 +1212,63 @@ fn process_partition(st: &mut CState, mv: &mut MState, srcs: &[AState], rd: &[Sc
         }
     }
     walk_groups(st, nl, ctx);
+}
+
+/// Per thread of the place phase: decoded events of each person partition
+/// as runs of one ID: [user, count, keys...], keys `ts << 32 | pc` in number
+/// order.
+struct XState {
+    runs: Vec<Vec<u64>>,
+    slot: Vec<u64>,
+    recs: Vec<IxRec>,
+}
+
+/// X: one range of event numbers. Every copy goes to its number's slot; the
+/// copy with the smallest ingest_ts keeps it (equal ingest: identical
+/// copies). Winners are read in number order and leave as runs of one ID.
+#[inline(never)]
+fn place_partition(x: &mut XState, a: &[AState], q: usize, ishift: u32, p2: u32) {
+    let range = 1usize << ishift;
+    let base = (q << ishift) as u32;
+    // Copies of this range, contiguous; a slot holds (ingest + 2^31) << 32 |
+    // (copy index + 1), so the smallest ingest wins with one compare.
+    x.recs.clear();
+    for s in a {
+        x.recs.extend_from_slice(&s.ix.parts[q]);
+    }
+    x.slot.clear();
+    x.slot.resize(range, u64::MAX);
+    let slot = &mut x.slot[..];
+    for (g, r) in x.recs.iter().enumerate() {
+        let k = (r.v - base) as usize;
+        let w = ((r.ingest as i64 + (1 << 31)) as u64) << 32 | g as u64;
+        unsafe {
+            let c = slot.get_unchecked_mut(k);
+            *c = (*c).min(w);
+        }
+    }
+    let mut run_user = 0u64;
+    let (mut pp, mut h) = (usize::MAX, 0usize);
+    for &w in slot.iter() {
+        if w == u64::MAX {
+            continue;
+        }
+        let r = unsafe { x.recs.get_unchecked(w as u32 as usize) };
+        if r.ts == TOMB {
+            continue;
+        }
+        if pp == usize::MAX || r.user != run_user {
+            pp = part(r.user, p2);
+            let v = &mut x.runs[pp];
+            v.push(r.user);
+            v.push(0);
+            h = v.len() - 1;
+            run_user = r.user;
+        }
+        let v = unsafe { x.runs.get_unchecked_mut(pp) };
+        v.push((r.ts as u64) << 32 | r.pc as u64);
+        v[h] += 1;
+    }
 }
 
 /// D2: one partition's linked persons, from the runs D1 moved here: per run
@@ -1260,6 +1407,11 @@ pub fn run() -> bool {
     }
 
     let event_maps: Vec<Option<Mmap>> = list_csv(&data.join("events")).iter().map(|p| map_file(p)).collect();
+    // The event-ID key, from a sample of IDs (any failure: no indexed path).
+    let ev_bytes: usize = event_maps.iter().flatten().map(|m| m.len()).sum();
+    let ibits = (usize::BITS - (ev_bytes / 50).leading_zeros()).clamp(12, 31);
+    let ixb = 9u32.min(ibits);
+    let ekey = if env("GEN", "1") == "1" { sample_key(&event_maps, ibits) } else { None };
     let click_maps: Vec<Option<Mmap>> = list_csv(&data.join("clicks")).iter().map(|p| map_file(p)).collect();
     let link_maps: Vec<Option<Mmap>> = list_csv(&data.join("links")).iter().map(|p| map_file(p)).collect();
     let event_bytes: usize = event_maps.iter().flatten().map(|m| m.len()).sum();
@@ -1314,6 +1466,9 @@ pub fn run() -> bool {
         p2_bits,
         idx_bits: 32 - tbits - p2_bits,
         fast_ts: FastTs::new(ws - REACH - 10 * DAY, we + 10 * DAY),
+        ekey,
+        ibits,
+        ishift: ibits - ixb,
     };
     let (p1, p2) = (1usize << ctx.p1_bits, 1usize << ctx.p2_bits);
     if std::env::var("CBENCH").is_ok() {
@@ -1343,6 +1498,7 @@ pub fn run() -> bool {
         pe: Scatter16::new(p2, per_pe),
         dd: Scatter16::new(p1, per_dd),
         pc: Scatter::new(p2, per_pe / 4),
+        ix: Scatter::new(1 << ixb, if ekey.is_some() { (est_events << 1 >> ixb) / threads * 5 / 8 + 64 } else { 0 }),
         sc: Scanner::new(),
         buf: Vec::new(),
         bad: false,
@@ -1410,6 +1566,7 @@ pub fn run() -> bool {
         s.pe.flush();
         s.dd.flush();
         s.pc.flush();
+        s.ix.flush();
     });
     // Every linked ID and its person (itself for the set's smallest ID).
     let mut rd: Vec<Scatter16<Rd>>;
@@ -1445,6 +1602,14 @@ pub fn run() -> bool {
         run_jobs(&mut b_states, p1, |st, j| dedup_partition(a, j, bases, p1b, p2b, ib, st));
     }
     log!(t0, "dedup");
+
+    // X: decoded events, deduplicated by number, leave as runs of one ID.
+    let mut x_states: Vec<XState> = (0..threads).map(|_| XState { runs: (0..p2).map(|_| Vec::new()).collect(), slot: Vec::new(), recs: Vec::new() }).collect();
+    if ctx.ekey.is_some() {
+        let (a, ishift, p2b) = (&a_states, ctx.ishift, ctx.p2_bits);
+        run_jobs(&mut x_states, 1 << ixb, |x, q| place_partition(x, a, q, ishift, p2b));
+    }
+    log!(t0, "place");
 
     // D: sessions.
     let ncamp = ctx.campaign_ids.len();
@@ -1502,10 +1667,11 @@ pub fn run() -> bool {
         let rd = &rd;
         // D1: own rows; persons without links are walked, linked IDs' rows move.
         let mut order: Vec<usize> = (0..p2).collect();
-        let size = |j: usize| a.iter().map(|s| s.pe.len(j) + s.pc.parts[j].len()).sum::<usize>();
+        let size = |j: usize| a.iter().map(|s| s.pe.len(j) + s.pc.parts[j].len()).sum::<usize>() + x_states.iter().map(|x| x.runs[j].len()).sum::<usize>();
         order.sort_unstable_by_key(|&j| std::cmp::Reverse(size(j)));
         let mut pairs: Vec<(&mut CState, &mut MState)> = c_states.iter_mut().zip(m_states.iter_mut()).collect();
-        run_jobs(&mut pairs, p2, |(st, mv), k| process_partition(st, mv, a, rd, order[k], ctx));
+        let xs = &x_states;
+        run_jobs(&mut pairs, p2, |(st, mv), k| process_partition(st, mv, a, xs, rd, order[k], ctx));
         drop(pairs);
         if std::env::var("FSTATS").is_ok() {
             let mv: usize = (0..p2).map(|j| m_states.iter().map(|m| m.ev[j].len()).sum::<usize>()).sum();

@@ -5,6 +5,7 @@
 mod bench;
 mod csv;
 mod fast;
+mod gen;
 mod keys;
 mod legacy;
 mod out;

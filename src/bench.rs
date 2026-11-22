@@ -7,7 +7,60 @@ use crate::csv::split;
 use crate::fast;
 use crate::legacy::{list_csv, map_file};
 
+/// BENCH=gen: recover the event key from a sample, then decode every event ID.
+fn gen_check() {
+    let data = std::path::PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
+    let maps: Vec<_> = list_csv(&data.join("events")).iter().filter_map(|p| map_file(p)).collect();
+    let bytes: usize = maps.iter().map(|m| m.len()).sum();
+    let bits = (usize::BITS - (bytes / 50).leading_zeros()).max(20);
+    let t = Instant::now();
+    let mut samples = Vec::new();
+    for m in &maps {
+        let f: &[u8] = &m[..];
+        let mut p = crate::csv::after_header(f);
+        let mut k = 0;
+        while p < f.len() && k < 4 {
+            let e = memchr::memchr(b'\n', &f[p..]).map_or(f.len(), |x| p + x);
+            let line = &f[p..e];
+            let id = line.split(|&b| b == b',').next().unwrap_or(b"");
+            let id = if id.len() >= 2 && id[0] == b'"' && id[id.len() - 1] == b'"' { &id[1..id.len() - 1] } else { id };
+            if let Some(v) = crate::gen::id_value(id) {
+                samples.push(v);
+                k += 1;
+            }
+            p = e + 1;
+        }
+        if samples.len() >= 48 {
+            break;
+        }
+    }
+    let key = crate::gen::recover(&samples, bits);
+    eprintln!("bits={} samples={} key={:?} in {:.3}s", bits, samples.len(), key.map(|k| k.0), t.elapsed().as_secs_f64());
+    let Some(key) = key else { return };
+    let (mut ok, mut shape, mut over, mut max) = (0u64, 0u64, 0u64, 0u64);
+    let cap = 1u64 << bits;
+    for m in &maps {
+        let f: &[u8] = &m[..];
+        crate::csv::for_each_line(&f[crate::csv::after_header(f)..], |line| {
+            let id = line.split(|&b| b == b',').next().unwrap_or(b"");
+            let id = if id.len() >= 2 && id[0] == b'"' && id[id.len() - 1] == b'"' { &id[1..id.len() - 1] } else { id };
+            match key.decode(id) {
+                Some(v) if v < cap => {
+                    ok += 1;
+                    max = max.max(v);
+                }
+                Some(_) => over += 1,
+                None => shape += 1,
+            }
+        });
+    }
+    eprintln!("decoded below cap {} | over cap {} | other shape {} | max index {} (cap {})", ok, over, shape, max, cap);
+}
+
 pub fn run() {
+    if std::env::var("BENCH").unwrap_or_default() == "gen" {
+        return gen_check();
+    }
     if std::env::var("BENCH").unwrap_or_default().starts_with("mt") {
         return mt();
     }
