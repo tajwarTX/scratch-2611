@@ -987,8 +987,8 @@ unsafe fn user_key(p: *const u8, n: usize, src: u64, lu: &mut Scatter16<Lu>, p2:
         }
     }
     let b = std::slice::from_raw_parts(p, n);
-    let key = keys::fp_key(b);
-    lu.push(part(key, p2), Lu { key, w: keys::name_word(b, src) });
+    let (key, w) = keys::fp_key_and_name_word(b, src);
+    lu.push(part(key, p2), Lu { key, w });
     key
 }
 

@@ -113,6 +113,33 @@ pub fn fp_key(s: &[u8]) -> u64 {
     INTERN_BIT | FP_BIT | (hash_padded(s) & FP_MASK & FP_TEST_MASK.load(AtomicOrdering::Relaxed)) | 1
 }
 
+/// Computes a long ID's fingerprint and collision-check word in one pass.
+#[inline(always)]
+pub fn fp_key_and_name_word(s: &[u8], src: u64) -> (u64, u64) {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let n = s.len();
+    let mut fp = (n as u64).wrapping_mul(K);
+    let mut check = 0x243F_6A88_85A3_08D3 ^ n as u64;
+    let mut i = 0;
+    while i < n {
+        let len = (n - i).min(8);
+        let mut word = unsafe { (s.as_ptr().add(i) as *const u64).read_unaligned() };
+        if len < 8 {
+            word = unsafe { std::arch::x86_64::_bzhi_u64(word, (8 * len) as u32) };
+        }
+        fp = (fp ^ word).wrapping_mul(K);
+        fp ^= fp >> 29;
+        check = (check.rotate_left(23) ^ word).wrapping_mul(0xA076_1D64_78BD_642F);
+        i += len;
+    }
+    let key = INTERN_BIT | FP_BIT | ((fp.wrapping_mul(0xD6E8_FEB8_6659_7F4B) ^ (fp >> 32)) & FP_MASK & FP_TEST_MASK.load(AtomicOrdering::Relaxed)) | 1;
+    if n > 255 {
+        NAMES_FAIL.store(true, AtomicOrdering::Relaxed);
+    }
+    let check = (check ^ (check >> 31)).wrapping_mul(0xE703_7ED1_A0B4_28DB) >> 48;
+    (key, check << 48 | ((n as u64 & 0xFF) << 40) | src)
+}
+
 /// Test hook (FP_TEST_BITS): narrows fingerprints so that collisions happen.
 pub static FP_TEST_MASK: AtomicU64 = AtomicU64::new(u64::MAX);
 
@@ -581,6 +608,16 @@ fn cmp_slow(a: u64, b: u64) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_fingerprint_matches_separate_hashes() {
+        for n in 0..=96 {
+            let bytes: Vec<u8> = (0..n + 8).map(|i| (i * 37 + n * 11) as u8).collect();
+            let want = (fp_key(&bytes[..n]), name_word(&bytes[..n], 0x1234_5678));
+            let got = fp_key_and_name_word(&bytes[..n], 0x1234_5678);
+            assert_eq!(got, want, "length {n}");
+        }
+    }
 
     #[test]
     fn interning_is_exact_and_concurrent() {

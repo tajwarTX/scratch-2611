@@ -8,6 +8,15 @@ use crate::fast;
 use crate::legacy::{list_csv, map_file};
 
 pub fn run() {
+    // Match production defaults rather than Scanner's standalone default.
+    crate::tok::TOK.store(
+        std::env::var("TOK").unwrap_or_else(|_| "1".into()).parse().expect("TOK"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    crate::tok::PREFETCH.store(
+        std::env::var("PF").unwrap_or_else(|_| "0".into()) == "1",
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if std::env::var("BENCH").unwrap_or_default().starts_with("mt") {
         return mt();
     }
