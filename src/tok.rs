@@ -365,6 +365,138 @@ impl Scanner {
     }
 }
 
+
+/// Tokenizer choice: 1 = batch scanner (`Scanner::scan`), 2 = per-line windows (`scan_lines`).
+pub static TOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
+
+/// Comma and newline masks, quote mask and newline mask of the 64 bytes at `p`.
+#[inline(always)]
+unsafe fn win(p: *const u8) -> (u64, u64, u64) {
+    masks(p)
+}
+
+/// Field end search for a field longer than one window: the next `,` or
+/// `\n` at or after `c` (one exists before `e`: lines end with `\n`).
+#[cold]
+#[inline(never)]
+unsafe fn long_field_end(data: *const u8, c: usize, e: usize) -> usize {
+    let sl = std::slice::from_raw_parts(data.add(c), e - c);
+    c + memchr::memchr2(b',', b'\n', sl).unwrap_or(e - c)
+}
+
+/// Whether the field [a, b) has quotes only as one pair around all of it,
+/// or none (bytes checked one by one: only for fields longer than a window).
+#[cold]
+#[inline(never)]
+unsafe fn long_field_quotes(data: *const u8, a: usize, b: usize) -> Option<(usize, usize)> {
+    let sl = std::slice::from_raw_parts(data.add(a), b - a);
+    let n = sl.iter().filter(|&&x| x == b'"').count();
+    if n == 0 {
+        return Some((a, b));
+    }
+    if n == 2 && sl.len() >= 2 && sl[0] == b'"' && sl[sl.len() - 1] == b'"' {
+        return Some((a + 1, b - 1));
+    }
+    None
+}
+
+impl Scanner {
+    /// Same lines and values as `scan`, found per line from 64-byte windows:
+    /// every comma separates fields, only `\n` ends a line, and a field may
+    /// hold quotes only as one pair around all of it; any other line is
+    /// malformed and skipped (rules.md, CSV dialect). `s` is a line start, `e`
+    /// a line end + 1; PAD bytes around are readable.
+    #[inline(always)]
+    pub unsafe fn scan_lines<const N: usize>(&mut self, data: *const u8, s: usize, e: usize, mut each: impl FnMut(&[u32; N], &[u32; N])) {
+        use std::arch::x86_64::{_blsr_u64, _bzhi_u64};
+        let (mut st, mut en) = ([0u32; N], [0u32; N]);
+        let mut c = s;
+        // Window base, its remaining separators (lowest = the next one at or
+        // after c), and its quote and newline masks.
+        let mut wb = c;
+        let (mut x, mut qm, mut nm) = win(data.add(wb));
+        while c < e {
+            let line = c;
+            let mut bad = 0u64;
+            for i in 0..N {
+                if x == 0 {
+                    wb = c;
+                    (x, qm, nm) = win(data.add(wb));
+                    if x == 0 {
+                        // A field of 64 bytes or more (never in the usual data).
+                        c = self.long_line::<N>(data, line, e, &mut each);
+                        wb = c;
+                        (x, qm, nm) = win(data.add(wb));
+                        break;
+                    }
+                }
+                let k = x.trailing_zeros() as usize;
+                x = _blsr_u64(x);
+                let (f, end) = (c - wb, wb + k);
+                let n = k - f;
+                let nl = (nm >> k) & 1;
+                let q = _bzhi_u64(qm >> f, n as u32);
+                let pair = 1u64 | (1u64 << n.saturating_sub(1));
+                let t = ((q == pair) & (n >= 2)) as usize;
+                bad |= ((q != 0) & (t == 0)) as u64;
+                bad |= if i + 1 == N { nl ^ 1 } else { nl };
+                st[i] = (c + t) as u32;
+                en[i] = (end - t) as u32;
+                c = end + 1;
+                if i + 1 == N {
+                    if bad == 0 {
+                        each(&st, &en);
+                    } else {
+                        // Malformed (or a newline came early): resume after the line's newline.
+                        c = skip_line(data, line, e);
+                        wb = c;
+                        (x, qm, nm) = win(data.add(wb));
+                    }
+                }
+            }
+        }
+    }
+
+    /// One line holding a field of 64 bytes or more, checked byte by byte;
+    /// returns the next line's start.
+    #[cold]
+    #[inline(never)]
+    unsafe fn long_line<const N: usize>(&mut self, data: *const u8, line: usize, e: usize, each: &mut impl FnMut(&[u32; N], &[u32; N])) -> usize {
+        let next = skip_line(data, line, e);
+        let stop = if next > line && *data.add(next - 1) == b'\n' { next - 1 } else { next };
+        let (mut st, mut en) = ([0u32; N], [0u32; N]);
+        let mut c = line;
+        for i in 0..N {
+            let end = if i + 1 == N { stop } else { long_field_end(data, c, stop) };
+            if end >= stop && i + 1 != N {
+                return next;
+            }
+            match long_field_quotes(data, c, end) {
+                Some((a, b)) => {
+                    st[i] = a as u32;
+                    en[i] = b as u32;
+                }
+                None => return next,
+            }
+            c = end + 1;
+        }
+        // The last field must not hold a comma.
+        let last = std::slice::from_raw_parts(data.add(st[N - 1] as usize), (en[N - 1] - st[N - 1]) as usize);
+        if !last.contains(&b',') {
+            each(&st, &en);
+        }
+        next
+    }
+}
+
+
+/// The start of the line after the one holding `at`.
+#[inline(never)]
+unsafe fn skip_line(data: *const u8, at: usize, e: usize) -> usize {
+    let sl = std::slice::from_raw_parts(data.add(at), e - at);
+    at + memchr::memchr(b'\n', sl).map_or(e - at, |x| x + 1)
+}
+
 /// Runs `scan` over `[s, e)` of a whole file: the part far from the file's
 /// end directly, the rest from a padded copy (with a `\n` added when the
 /// file does not end with one). `each` gets the line's base pointer.
@@ -417,7 +549,11 @@ pub fn scan_file_src<const N: usize>(
     }
     if s.max(PAD) == s && mid > s {
         let p = file.as_ptr();
-        unsafe { sc.scan::<N>(p, s, mid, #[inline(always)] |a, b| each(p, 0, a, b), &mut ahead) };
+        if TOK.load(std::sync::atomic::Ordering::Relaxed) == 2 {
+            unsafe { sc.scan_lines::<N>(p, s, mid, #[inline(always)] |a, b| each(p, 0, a, b)) };
+        } else {
+            unsafe { sc.scan::<N>(p, s, mid, #[inline(always)] |a, b| each(p, 0, a, b), &mut ahead) };
+        }
     } else {
         mid = s;
     }
@@ -432,7 +568,11 @@ pub fn scan_file_src<const N: usize>(
         }
         let p = buf.as_ptr();
         let origin = mid as isize - PAD as isize;
-        unsafe { sc.scan::<N>(p, PAD, end, |a, b| each(p, origin, a, b), &mut ahead) };
+        if TOK.load(std::sync::atomic::Ordering::Relaxed) == 2 {
+            unsafe { sc.scan_lines::<N>(p, PAD, end, |a, b| each(p, origin, a, b)) };
+        } else {
+            unsafe { sc.scan::<N>(p, PAD, end, |a, b| each(p, origin, a, b), &mut ahead) };
+        }
     }
 }
 

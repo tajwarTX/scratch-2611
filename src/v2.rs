@@ -1320,6 +1320,7 @@ fn bits_for(items: usize, per_part: usize, max_bits: u32) -> u32 {
 pub fn run() -> bool {
     let t0 = Instant::now();
     crate::tok::PREFETCH.store(env("PF", "0") == "1", Ordering::Relaxed);
+    crate::tok::TOK.store(env("TOK", "1").parse().unwrap(), Ordering::Relaxed);
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let out_dir = PathBuf::from(env("OUTPUT_DIR", "/output"));
     let threads: usize = std::env::var("NCPU")
