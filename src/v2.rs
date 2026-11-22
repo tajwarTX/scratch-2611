@@ -347,8 +347,15 @@ const CART: u32 = u32::from_le_bytes(*b"cart");
 const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 
 /// A key for the `n` bytes at `p` (16 readable).
+/// Probe only: bit 1 replaces user-id interning with a hash fingerprint, bit 2
+/// replaces the event-id hash with 8 raw bytes. Both are INEXACT (never a submission).
+static SKIPI: AtomicU32 = AtomicU32::new(0);
+
 #[inline(always)]
 unsafe fn key_at(p: *const u8, n: usize) -> u64 {
+    if SKIPI.load(Ordering::Relaxed) & 1 != 0 && n > 9 {
+        return keys::INTERN_BIT | (keys::hash_bytes(std::slice::from_raw_parts(p, n)) & 0x3FFF_FFFF_FFFF_FFFF);
+    }
     if n == 9 {
         // The usual ID length, in a dozen instructions (same value as `pack9`).
         const M7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
@@ -431,7 +438,8 @@ unsafe fn convert_event(ctx: &Ctx, p: *const u8, origin: isize, fbase: usize, s:
             // A long id: a fingerprint for dedup's tables, and where its bytes are.
             let bytes = std::slice::from_raw_parts(at(0), ln(0));
             let src = (fbase as isize + origin + (at(0) as isize - p as isize)) as u64;
-            (keys::INTERN_BIT | ((keys::hash_bytes(bytes) & 0x7FFF_FFFF) << 32) | (src >> 8), src)
+            let fp = if SKIPI.load(Ordering::Relaxed) & 2 != 0 { (at(0).add(1) as *const u64).read_unaligned() } else { keys::hash_bytes(bytes) };
+            (keys::INTERN_BIT | ((fp & 0x7FFF_FFFF) << 32) | (src >> 8), src)
         }
     };
     // ingest must fit 24 signed bits (the fast pipeline gives up otherwise).
@@ -1245,6 +1253,7 @@ fn bits_for(items: usize, per_part: usize, max_bits: u32) -> u32 {
 pub fn run() -> bool {
     let t0 = Instant::now();
     crate::tok::PREFETCH.store(env("PF", "0") == "1", Ordering::Relaxed);
+    SKIPI.store(env("SKIPI", "0").parse().unwrap(), Ordering::Relaxed);
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let out_dir = PathBuf::from(env("OUTPUT_DIR", "/output"));
     let threads: usize = std::env::var("NCPU")
