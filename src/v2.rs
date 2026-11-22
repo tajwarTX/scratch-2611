@@ -315,14 +315,30 @@ impl Links {
     }
 }
 
-fn parse_links(file: &[u8], start: usize, end: usize, links: &Links, sc: &mut Scanner) {
-    tok::scan_file_pf::<2>(sc, file, start, end, #[inline(always)]
-    |p, s, e| unsafe {
+/// The key of a linked ID; a long one's name is recorded now (links are compared by bytes).
+#[inline(always)]
+unsafe fn link_key(p: *const u8, n: usize, src: u64) -> u64 {
+    if n <= 9 {
+        if let Some(k) = fast::pack9(p, n) {
+            return k;
+        }
+    }
+    let b = std::slice::from_raw_parts(p, n);
+    let key = keys::fp_key(b);
+    keys::note_nonpacked();
+    keys::name_insert(key, keys::check_hash(b) << 40 | src);
+    key
+}
+
+fn parse_links(file: &[u8], start: usize, end: usize, links: &Links, sc: &mut Scanner, fbase: usize) {
+    tok::scan_file_src::<2>(sc, file, start, end, #[inline(always)]
+    |p, origin, s, e| unsafe {
         let (na, nb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
         if na == 0 || nb == 0 {
             return;
         }
-        let (ka, kb) = (key_at(p.add(s[0] as usize), na), key_at(p.add(s[1] as usize), nb));
+        let src = |i: usize| (fbase as isize + origin + s[i] as isize) as u64;
+        let (ka, kb) = (link_key(p.add(s[0] as usize), na, src(0)), link_key(p.add(s[1] as usize), nb, src(1)));
         if ka != kb {
             let (a, b) = (links.insert(ka), links.insert(kb));
             links.union(a, b);
@@ -337,6 +353,7 @@ struct AState {
     pe: Scatter16<PEv>,
     dd: Scatter16<Dd>,
     pc: Scatter<PCk, 8>,
+    lu: Scatter16<Lu>,
     sc: Scanner,
     buf: Vec<u8>,
     bad: bool,
@@ -418,7 +435,7 @@ struct EvOut {
 /// Converts one well-formed event line (field ranges `s`/`e` from `p`, PAD
 /// readable around each field). None: empty event_id, the line is dropped.
 #[inline(always)]
-unsafe fn convert_event(ctx: &Ctx, p: *const u8, origin: isize, fbase: usize, s: &[u32; 7], e: &[u32; 7]) -> Option<EvOut> {
+unsafe fn convert_event(ctx: &Ctx, p: *const u8, origin: isize, fbase: usize, s: &[u32; 7], e: &[u32; 7], lu: &mut Scatter16<Lu>) -> Option<EvOut> {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
     let at = |i: usize| p.add(s[i] as usize);
     let ln = |i: usize| (e[i] - s[i]) as usize;
@@ -464,7 +481,8 @@ unsafe fn convert_event(ctx: &Ctx, p: *const u8, origin: isize, fbase: usize, s:
         if purchase {
             pc |= ctx.category(std::slice::from_raw_parts(at(5), ln(5))) << 24;
         }
-        Some(PEv { person: key_at(at(1), ln(1)), ts: (ts - base) as u32, pc })
+        let usrc = (fbase as isize + origin + (at(1) as isize - p as isize)) as u64;
+        Some(PEv { person: user_key(at(1), ln(1), usrc, lu, ctx.p2_bits), ts: (ts - base) as u32, pc })
     };
     Some(EvOut { id, src, ingest, ev })
 }
@@ -474,10 +492,10 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
     let (p1, p2, ib) = (ctx.p1_bits, ctx.p2_bits, ctx.idx_bits);
     let loc_hi = st.tid << (p2 + ib);
     let idx_max = (1usize << ib) - 2;
-    let AState { pe, dd, sc, bad, .. } = st;
+    let AState { pe, dd, sc, bad, lu, .. } = st;
     tok::scan_file_src::<7>(sc, file, start, end, #[inline(always)]
     |p, origin, s, e| unsafe {
-        let Some(o) = convert_event(ctx, p, origin, fbase, s, e) else { return };
+        let Some(o) = convert_event(ctx, p, origin, fbase, s, e, lu) else { return };
         let ingest = o.ingest.unwrap_or_else(|| {
             *bad = true;
             0
@@ -509,6 +527,7 @@ fn conv_bench(ctx: &Ctx, maps: &[Option<Mmap>]) {
         }
     });
     let mode: u32 = env("CBENCH", "9").parse().unwrap();
+    let mut bench_lu: Scatter16<Lu> = Scatter16::new(1 << ctx.p2_bits, 1024);
     for round in 0..3 {
         let t = Instant::now();
         let mut sink = 0u64;
@@ -537,7 +556,7 @@ fn conv_bench(ctx: &Ctx, maps: &[Option<Mmap>]) {
                 }
                 continue;
             }
-            if let Some(o) = unsafe { convert_event(ctx, base, 0, 0, s, e) } {
+            if let Some(o) = unsafe { convert_event(ctx, base, 0, 0, s, e, &mut bench_lu) } {
                 sink = sink.wrapping_add(o.id ^ o.ingest.unwrap_or(0) as u64);
                 if let Some(ev) = o.ev {
                     sink = sink.wrapping_add(ev.person ^ ev.ts as u64 ^ ev.pc as u64);
@@ -551,7 +570,7 @@ fn conv_bench(ctx: &Ctx, maps: &[Option<Mmap>]) {
 #[inline(never)]
 fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState, fbase: usize) {
     let (lo, hi, base, p2) = (ctx.ws - REACH, ctx.we, ctx.base, ctx.p2_bits);
-    let AState { pc, sc, .. } = st;
+    let AState { pc, sc, lu, .. } = st;
     tok::scan_file_src::<4>(sc, file, start, end, #[inline(always)]
     |p, origin, s, e| unsafe {
         let at = |i: usize| p.add(s[i] as usize);
@@ -564,7 +583,7 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
             _ => return,
         };
         let Some(camp) = ctx.campaign(std::slice::from_raw_parts(at(2), ln(2))) else { return };
-        let user = key_at(at(1), ln(1));
+        let user = user_key(at(1), ln(1), (fbase as isize + origin + (at(1) as isize - p as isize)) as u64, lu, p2);
         // A click id is only ever ordered (ties on ts): a long one points at its bytes.
         let id = match fast::pack9(at(0), ln(0)) {
             Some(k) => k,
@@ -950,6 +969,62 @@ struct Rd {
     root: u64,
 }
 
+/// A long user ID seen in an event or click: its fingerprint key and
+/// check_hash << 40 | source offset.
+#[derive(Clone, Copy, Default)]
+struct Lu {
+    key: u64,
+    w: u64,
+}
+
+/// The key of a user ID at `p` (n bytes, source offset `src`): packed, or a
+/// fingerprint whose name goes to `lu` (checked and recorded after the parse).
+#[inline(always)]
+unsafe fn user_key(p: *const u8, n: usize, src: u64, lu: &mut Scatter16<Lu>, p2: u32) -> u64 {
+    if n <= 9 {
+        if let Some(k) = fast::pack9(p, n) {
+            return k;
+        }
+    }
+    let b = std::slice::from_raw_parts(p, n);
+    let key = keys::fp_key(b);
+    lu.push(part(key, p2), Lu { key, w: keys::check_hash(b) << 40 | src });
+    key
+}
+
+/// Checks one partition of long user IDs (same key, same check hash) and
+/// records each distinct one's name.
+fn check_names(srcs: &[AState], j: usize, tab: &mut Vec<u64>) {
+    let n: usize = srcs.iter().map(|s| s.lu.len(j)).sum();
+    if n == 0 {
+        return;
+    }
+    let cap = (n * 2).next_power_of_two();
+    tab.clear();
+    tab.resize(cap * 2, 0);
+    for s in srcs {
+        for r in s.lu.records(j) {
+            let mut i = (r.key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & (cap - 1);
+            loop {
+                let k = tab[2 * i];
+                if k == r.key {
+                    if tab[2 * i + 1] >> 40 != r.w >> 40 {
+                        keys::NAMES_FAIL.store(true, Ordering::Relaxed);
+                    }
+                    break;
+                }
+                if k == 0 {
+                    tab[2 * i] = r.key;
+                    tab[2 * i + 1] = r.w;
+                    keys::name_insert(r.key, r.w);
+                    break;
+                }
+                i = (i + 1) & (cap - 1);
+            }
+        }
+    }
+}
+
 /// Per-thread rows of linked IDs, by their person's partition, one run per
 /// ID: in `ev` the person, the run's counts (events << 32 | clicks) and its
 /// event keys; in `ck` its clicks.
@@ -1317,10 +1392,16 @@ pub fn run() -> bool {
     let total_bytes: usize = event_maps.iter().chain(&click_maps).chain(&link_maps).flatten().map(|m| m.len()).sum();
     // The arena is a virtual reservation; ARENA_DIV shrinks it (experiment).
     let arena_div: usize = env("ARENA_DIV", "1").parse().unwrap();
-    keys::init_interner(total_bytes / 8000 + (1 << 14), (total_bytes / arena_div).max(64 << 20));
+    keys::init_interner(1 << 12, (total_bytes / arena_div).max(64 << 20) >> 4);
+    // Long user IDs are fingerprint keys; their names: ~1 distinct per 10 KB of input.
+    keys::init_names(total_bytes / 8000 + (1 << 14));
+    if let Ok(b) = std::env::var("FP_TEST_BITS") {
+        keys::FP_TEST_MASK.store((1u64 << b.parse::<u32>().unwrap()) - 1, Ordering::Relaxed);
+    }
     // One offset space over the event and click files, for keys that point into them.
-    let (mut src_files, mut ev_base, mut ck_base) = (Vec::new(), vec![0usize; event_maps.len()], vec![0usize; click_maps.len()]);
-    for (maps, bases) in [(&event_maps, &mut ev_base), (&click_maps, &mut ck_base)] {
+    let (mut src_files, mut ev_base, mut ck_base, mut lk_base) =
+        (Vec::new(), vec![0usize; event_maps.len()], vec![0usize; click_maps.len()], vec![0usize; link_maps.len()]);
+    for (maps, bases) in [(&event_maps, &mut ev_base), (&click_maps, &mut ck_base), (&link_maps, &mut lk_base)] {
         for (i, m) in maps.iter().enumerate() {
             if let Some(m) = m {
                 bases[i] = src_files.len();
@@ -1329,7 +1410,7 @@ pub fn run() -> bool {
         }
     }
     let src_bases = keys::set_source(&src_files);
-    for b in ev_base.iter_mut().chain(ck_base.iter_mut()) {
+    for b in ev_base.iter_mut().chain(ck_base.iter_mut()).chain(lk_base.iter_mut()) {
         *b = src_bases[*b];
     }
     let event_bytes: usize = event_maps.iter().flatten().map(|m| m.len()).sum();
@@ -1413,6 +1494,7 @@ pub fn run() -> bool {
         pe: Scatter16::new(p2, per_pe),
         dd: Scatter16::new(p1, per_dd),
         pc: Scatter::new(p2, per_pe / 4),
+        lu: Scatter16::new(p2, per_pe / 6),
         sc: Scanner::new(),
         buf: Vec::new(),
         bad: false,
@@ -1434,7 +1516,7 @@ pub fn run() -> bool {
     run_jobs(&mut a_states, jobs.len(), |st, j| {
         let (kind, fi, s, e) = jobs[j];
         let mut run = |st: &mut AState, data: &[u8], s: usize, e: usize| match kind {
-            0 => parse_links(data, s, e, &links, &mut st.sc),
+            0 => parse_links(data, s, e, &links, &mut st.sc, lk_base[fi]),
             1 => parse_events(data, s, e, &ctx, st, ev_base[fi]),
             _ => parse_clicks(data, s, e, &ctx, st, ck_base[fi]),
         };
@@ -1480,7 +1562,20 @@ pub fn run() -> bool {
         s.pe.flush();
         s.dd.flush();
         s.pc.flush();
+        s.lu.flush();
     });
+    {
+        let a = &a_states;
+        if a.iter().any(|s| (0..p2).any(|j| s.lu.len(j) != 0)) {
+            keys::note_nonpacked();
+        }
+        let mut tabs: Vec<Vec<u64>> = (0..threads).map(|_| Vec::new()).collect();
+        run_jobs(&mut tabs, p2, |t, j| check_names(a, j, t));
+    }
+    if keys::NAMES_FAIL.load(Ordering::Relaxed) {
+        eprintln!("an assumption of the fast pipeline does not hold (user id fingerprints)");
+        return false;
+    }
     // Every linked ID and its person (itself for the set's smallest ID).
     let mut rd: Vec<Scatter16<Rd>>;
     {

@@ -20,6 +20,108 @@ pub const INTERN_BIT: u64 = 1 << 63;
 pub const SRC_BIT: u64 = 1 << 62;
 /// With INTERN_BIT: a string on the heap (only when the arena was too small).
 const HEAP_BIT: u64 = 1 << 61;
+/// With INTERN_BIT: the low 60 bits are a hash of the string, whose bytes are
+/// found through the names table (see `name_insert`).
+pub const FP_BIT: u64 = 1 << 60;
+const FP_MASK: u64 = (1 << 60) - 1;
+
+/// Names of fingerprint keys: key -> (check hash << 40 | source offset).
+struct Names {
+    slots: Vec<[AtomicU64; 2]>,
+    mask: usize,
+    used: AtomicUsize,
+}
+static NAMES: AtomicPtr<Names> = AtomicPtr::new(std::ptr::null_mut());
+/// Set when two different strings were seen under one key (or the table is full):
+/// the fast pipeline gives up.
+pub static NAMES_FAIL: AtomicBool = AtomicBool::new(false);
+
+pub fn init_names(expect: usize) {
+    let cap = (expect.max(1024) * 4).next_power_of_two();
+    let slots = unsafe {
+        let layout = std::alloc::Layout::array::<[AtomicU64; 2]>(cap).unwrap();
+        let p = std::alloc::alloc_zeroed(layout) as *mut [AtomicU64; 2];
+        Vec::from_raw_parts(p, cap, cap)
+    };
+    let n = Box::new(Names { slots, mask: cap - 1, used: AtomicUsize::new(0) });
+    let old = NAMES.swap(Box::into_raw(n), AtomicOrdering::AcqRel);
+    if !old.is_null() {
+        std::mem::forget(old);
+    }
+    NAMES_FAIL.store(false, AtomicOrdering::Relaxed);
+}
+
+/// A second, independent hash of an ID (24 bits), to check that equal keys are equal strings.
+#[inline(always)]
+pub fn check_hash(s: &[u8]) -> u64 {
+    let mut h: u64 = 0x243F_6A88_85A3_08D3 ^ s.len() as u64;
+    for c in s.chunks(8) {
+        let mut b = [0u8; 8];
+        b[..c.len()].copy_from_slice(c);
+        h = (h.rotate_left(23) ^ u64::from_le_bytes(b)).wrapping_mul(0xA076_1D64_78BD_642F);
+    }
+    (h ^ (h >> 31)).wrapping_mul(0xE703_7ED1_A0B4_28DB) >> 40
+}
+
+/// The fingerprint key of an ID that does not pack.
+#[inline(always)]
+pub fn fp_key(s: &[u8]) -> u64 {
+    INTERN_BIT | FP_BIT | (hash_bytes(s) & FP_MASK & FP_TEST_MASK.load(AtomicOrdering::Relaxed)) | 1
+}
+
+/// Test hook (FP_TEST_BITS): narrows fingerprints so that collisions happen.
+pub static FP_TEST_MASK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Records `w` = check_hash << 40 | source offset as the name of `key` unless it has one;
+/// flags a failure when the existing name has another check hash.
+pub fn name_insert(key: u64, w: u64) {
+    let t = unsafe { &*NAMES.load(AtomicOrdering::Acquire) };
+    let mut i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & t.mask;
+    loop {
+        let s = &t.slots[i];
+        let k = s[0].load(AtomicOrdering::Acquire);
+        if k == 0 {
+            if t.used.fetch_add(1, AtomicOrdering::Relaxed) > t.mask / 2 {
+                NAMES_FAIL.store(true, AtomicOrdering::Relaxed);
+                return;
+            }
+            // The value first, then the key: a reader that sees the key sees its value.
+            match s[0].compare_exchange(0, key | 0, AtomicOrdering::AcqRel, AtomicOrdering::Acquire) {
+                Ok(_) => {
+                    s[1].store(w, AtomicOrdering::Release);
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
+        if k == key {
+            let mut v = s[1].load(AtomicOrdering::Acquire);
+            while v == 0 {
+                std::hint::spin_loop();
+                v = s[1].load(AtomicOrdering::Acquire);
+            }
+            if v >> 40 != w >> 40 {
+                NAMES_FAIL.store(true, AtomicOrdering::Relaxed);
+            }
+            return;
+        }
+        i = (i + 1) & t.mask;
+    }
+}
+
+fn name_of(key: u64) -> u64 {
+    let t = unsafe { &*NAMES.load(AtomicOrdering::Acquire) };
+    let mut i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as usize & t.mask;
+    loop {
+        let s = &t.slots[i];
+        let k = s[0].load(AtomicOrdering::Acquire);
+        if k == key {
+            return s[1].load(AtomicOrdering::Acquire) & OFF_MASK;
+        }
+        assert!(k != 0, "a fingerprint key without a name");
+        i = (i + 1) & t.mask;
+    }
+}
 const MAX_PACKED: usize = 9;
 
 #[inline(always)]
@@ -309,6 +411,9 @@ impl Interner {
 
     #[inline(always)]
     fn bytes_of(&self, k: u64) -> &[u8] {
+        if k & FP_BIT != 0 {
+            return source_slice(name_of(k));
+        }
         if k & SRC_BIT != 0 {
             return source_slice(k & OFF_MASK);
         }
