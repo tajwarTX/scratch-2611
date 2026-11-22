@@ -354,7 +354,8 @@ static SKIPI: AtomicU32 = AtomicU32::new(0);
 #[inline(always)]
 unsafe fn key_at(p: *const u8, n: usize) -> u64 {
     if SKIPI.load(Ordering::Relaxed) & 1 != 0 && n > 9 {
-        return keys::INTERN_BIT | (keys::hash_bytes(std::slice::from_raw_parts(p, n)) & 0x3FFF_FFFF_FFFF_FFFF);
+        // A decodable 9-char packed key (every 7-bit group nonzero), not interned.
+        return (keys::hash_bytes(std::slice::from_raw_parts(p, n)) & 0x7FFF_FFFF_FFFF_FFFF) | 0x102040810204081;
     }
     if n == 9 {
         // The usual ID length, in a dozen instructions (same value as `pack9`).
