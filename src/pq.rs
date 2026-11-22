@@ -5,6 +5,9 @@
 use std::io::Write;
 
 const ROW_GROUP: usize = 1 << 20;
+/// Bytes kept in memory before writing (`write_rows`), and rows encoded per step.
+const STREAM: usize = 1 << 20;
+const STEP_ROWS: usize = 16384;
 
 /// Physical types (parquet.thrift `Type`).
 const INT32: i32 = 1;
@@ -223,7 +226,20 @@ pub fn write_rows(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::
             Col::I64(v) => 8 * v.len(),
         };
     }
-    let mut buf: Vec<u8> = Vec::with_capacity(est);
+    // Streamed through a small buffer reused for the whole file: fresh memory
+    // faulted in by every thread at once costs far more than the writes.
+    let mut file = std::fs::File::create(path)?;
+    let mut buf: Vec<u8> = Vec::with_capacity(est.min(STREAM + (1 << 16)));
+    let mut base = 0usize;
+    macro_rules! spill {
+        () => {
+            if buf.len() >= STREAM {
+                file.write_all(&buf)?;
+                base += buf.len();
+                buf.clear();
+            }
+        };
+    }
     buf.extend_from_slice(b"PAR1");
     let mut groups: Vec<(usize, Vec<ChunkMeta>)> = Vec::new();
     // Per optional column: how many present values precede each row group.
@@ -236,11 +252,22 @@ pub fn write_rows(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::
         for (ci, c) in cols.iter().enumerate() {
             if let Col::Gen { kind, size, fill } = &c.data {
                 let body = size(start, end);
-                let offset = buf.len();
+                let offset = base + buf.len();
                 buf.extend_from_slice(&page_header(n, body, *kind == Kind::OptStr));
-                let at = buf.len();
-                fill(start, end, &mut buf);
-                assert_eq!(buf.len() - at, body, "column {} size", c.name);
+                let at = base + buf.len();
+                if *kind == Kind::OptStr {
+                    fill(start, end, &mut buf);
+                    spill!();
+                } else {
+                    let mut a = start;
+                    while a < end {
+                        let b = (a + STEP_ROWS).min(end);
+                        fill(a, b, &mut buf);
+                        spill!();
+                        a = b;
+                    }
+                }
+                assert_eq!(base + buf.len() - at, body, "column {} size", c.name);
                 let ty = match kind {
                     Kind::Str | Kind::OptStr => BYTE_ARRAY,
                     Kind::Date => INT32,
@@ -251,7 +278,7 @@ pub fn write_rows(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::
                     name: c.name.to_string(),
                     num_values: n as i64,
                     offset: offset as i64,
-                    size: (buf.len() - offset) as i64,
+                    size: (base + buf.len() - offset) as i64,
                 });
                 continue;
             }
@@ -305,7 +332,7 @@ pub fn write_rows(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::
                 }
                 Col::Gen { .. } => unreachable!(),
             };
-            let offset = buf.len();
+            let offset = base + buf.len();
             buf.extend_from_slice(&page_header(n, body.len(), optional));
             buf.extend_from_slice(&body);
             chunks.push(ChunkMeta {
@@ -313,8 +340,9 @@ pub fn write_rows(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::
                 name: c.name.to_string(),
                 num_values: n as i64,
                 offset: offset as i64,
-                size: (buf.len() - offset) as i64,
+                size: (base + buf.len() - offset) as i64,
             });
+            spill!();
         }
         groups.push((n, chunks));
         start = end;
@@ -384,5 +412,5 @@ pub fn write_rows(path: &std::path::Path, rows: usize, cols: &[Column]) -> std::
     buf.extend_from_slice(&t.out);
     buf.extend_from_slice(&(t.out.len() as u32).to_le_bytes());
     buf.extend_from_slice(b"PAR1");
-    std::fs::File::create(path)?.write_all(&buf)
+    file.write_all(&buf)
 }

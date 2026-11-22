@@ -1651,6 +1651,7 @@ pub fn run() -> bool {
         })
         .collect();
     let reps: usize = env("DREP", "1").parse().unwrap();
+    let overlap_out = env("OVERLAP_OUT", "0") == "1";
     SKIP.store(env("SKIP", "0").parse().unwrap(), Ordering::Relaxed);
     for rep in 0..reps {
         if rep > 0 {
@@ -1694,14 +1695,37 @@ pub fn run() -> bool {
         let ms = &m_states;
         let size = |j: usize| ms.iter().map(|m| m.ev[j].len() + m.ck[j].len()).sum::<usize>();
         order.sort_unstable_by_key(|&j| std::cmp::Reverse(size(j)));
-        run_jobs(&mut c_states, p2, |st, k| process_moved(st, ms, order[k], ctx));
+        if reps == 1 && overlap_out {
+            // Each thread writes its user_daily part as soon as it runs out of jobs,
+            // while the others finish theirs.
+            let user_dir = out_dir.join("user_daily");
+            std::fs::create_dir_all(&user_dir).expect("user_daily dir");
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|sc| {
+                for (t, st) in c_states.iter_mut().enumerate() {
+                    let (next, order, user_dir) = (&next, &order, &user_dir);
+                    sc.spawn(move || {
+                        loop {
+                            let k = next.fetch_add(1, Ordering::Relaxed);
+                            if k >= p2 {
+                                break;
+                            }
+                            process_moved(st, ms, order[k], ctx);
+                        }
+                        write_user_file(user_dir, ctx, t, st);
+                    });
+                }
+            });
+        } else {
+            run_jobs(&mut c_states, p2, |st, k| process_moved(st, ms, order[k], ctx));
+        }
         if reps > 1 {
             eprintln!("rep {} d1 {:.4} d2 {:.4} total {:.4}", rep, td1, td.elapsed().as_secs_f64() - td1, td.elapsed().as_secs_f64());
         }
     }
     log!(t0, "sessions");
 
-    write_outputs(&out_dir, &ctx, &c_states);
+    write_outputs(&out_dir, &ctx, &c_states, !(reps == 1 && overlap_out));
     log!(t0, "done");
     {
         // The process exits right after: freeing these piecemeal only costs time.
@@ -1747,29 +1771,11 @@ fn put_key(k: u64, out: &mut Vec<u8>) {
     }
 }
 
-fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
-    use crate::pq::{def_levels, def_levels_size, write, write_rows, Col, Column, Kind};
-    let user_dir = out_dir.join("user_daily");
-    let camp_dir = out_dir.join("campaign_daily");
-    std::fs::create_dir_all(&user_dir).expect("user_daily dir");
-    std::fs::create_dir_all(&camp_dir).expect("campaign_daily dir");
-    let (ncamp, ndays) = (ctx.campaign_ids.len(), ctx.ndays);
-    // Merge per-thread counters (day-major: index day * (ncamp + 1) + camp).
-    let mut acc = vec![[0u64; 4]; (ncamp + 1) * ndays];
-    for s in c_states {
-        for (t, x) in acc.iter_mut().zip(&s.acc) {
-            for i in 0..3 {
-                t[i] += x[i];
-            }
-        }
-        for (t, x) in acc.iter_mut().zip(&s.asst) {
-            t[3] += x;
-        }
-    }
-    std::thread::scope(|sc| {
-        for (t, s) in c_states.iter().enumerate() {
-            let path = user_dir.join(format!("part-{:05}.parquet", t));
-            sc.spawn(move || {
+/// Writes thread `t`'s user_daily part.
+fn write_user_file(user_dir: &Path, ctx: &Ctx, t: usize, s: &CState) {
+    use crate::pq::{def_levels, def_levels_size, write_rows, Col, Column, Kind};
+    let path = user_dir.join(format!("part-{:05}.parquet", t));
+    {
                 // Every column is encoded straight from the rows into the file buffer.
                 let rows = &s.rows[..];
                 let cats = &ctx.categories;
@@ -1824,7 +1830,34 @@ fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState]) {
                     ],
                 )
                 .expect("write user_daily");
-            });
+    }
+}
+
+fn write_outputs(out_dir: &Path, ctx: &Ctx, c_states: &[CState], users: bool) {
+    use crate::pq::{def_levels, def_levels_size, write, write_rows, Col, Column, Kind};
+    let user_dir = out_dir.join("user_daily");
+    let camp_dir = out_dir.join("campaign_daily");
+    std::fs::create_dir_all(&user_dir).expect("user_daily dir");
+    std::fs::create_dir_all(&camp_dir).expect("campaign_daily dir");
+    let (ncamp, ndays) = (ctx.campaign_ids.len(), ctx.ndays);
+    // Merge per-thread counters (day-major: index day * (ncamp + 1) + camp).
+    let mut acc = vec![[0u64; 4]; (ncamp + 1) * ndays];
+    for s in c_states {
+        for (t, x) in acc.iter_mut().zip(&s.acc) {
+            for i in 0..3 {
+                t[i] += x[i];
+            }
+        }
+        for (t, x) in acc.iter_mut().zip(&s.asst) {
+            t[3] += x;
+        }
+    }
+    std::thread::scope(|sc| {
+        if users {
+            for (t, s) in c_states.iter().enumerate() {
+                let user_dir = &user_dir;
+                sc.spawn(move || write_user_file(user_dir, ctx, t, s));
+            }
         }
         let acc = &acc;
         sc.spawn(move || {
