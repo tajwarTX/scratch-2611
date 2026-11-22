@@ -645,6 +645,8 @@ pub(crate) fn bits_for(items: usize, per_part: usize) -> u32 {
 }
 
 pub fn run() {
+    // Sized for an input where every ID is long (the general path is the fallback).
+    crate::keys::init_interner(1 << 23, 1 << 32);
     let t0 = Instant::now();
     eprintln!("using the general pipeline");
     let data = PathBuf::from(env("DATA_DIR", "/data"));

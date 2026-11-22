@@ -1261,6 +1261,10 @@ pub fn run() -> bool {
     let event_maps: Vec<Option<Mmap>> = list_csv(&data.join("events")).iter().map(|p| map_file(p)).collect();
     let click_maps: Vec<Option<Mmap>> = list_csv(&data.join("clicks")).iter().map(|p| map_file(p)).collect();
     let link_maps: Vec<Option<Mmap>> = list_csv(&data.join("links")).iter().map(|p| map_file(p)).collect();
+    // Long IDs are interned: about one line in eight has one (v5 data), and an
+    // input where every ID is long still fits the table's locked overflow path.
+    let total_bytes: usize = event_maps.iter().chain(&click_maps).chain(&link_maps).flatten().map(|m| m.len()).sum();
+    keys::init_interner(total_bytes / 600 + (1 << 14), total_bytes);
     let event_bytes: usize = event_maps.iter().flatten().map(|m| m.len()).sum();
     let link_bytes: usize = link_maps.iter().flatten().map(|m| m.len()).sum();
 
