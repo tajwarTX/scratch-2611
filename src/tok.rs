@@ -440,6 +440,8 @@ impl Scanner {
                 let t = ((q == pair) & (n >= 2)) as usize;
                 bad |= ((q != 0) & (t == 0)) as u64;
                 bad |= if i + 1 == N { nl ^ 1 } else { nl };
+                // An empty line is malformed (only reachable with one field).
+                bad |= (N == 1 && end == line) as u64;
                 st[i] = (c + t) as u32;
                 en[i] = (end - t) as u32;
                 c = end + 1;
