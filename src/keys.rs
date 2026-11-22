@@ -51,16 +51,41 @@ pub fn init_names(expect: usize) {
     NAMES_FAIL.store(false, AtomicOrdering::Relaxed);
 }
 
-/// A second, independent hash of an ID (24 bits), to check that equal keys are equal strings.
+/// A second, independent hash of an ID (16 bits), to check that equal keys are equal strings.
+/// The 8 bytes after `s` must be readable (input fields are padded).
 #[inline(always)]
 pub fn check_hash(s: &[u8]) -> u64 {
-    let mut h: u64 = 0x243F_6A88_85A3_08D3 ^ s.len() as u64;
-    for c in s.chunks(8) {
-        let mut b = [0u8; 8];
-        b[..c.len()].copy_from_slice(c);
-        h = (h.rotate_left(23) ^ u64::from_le_bytes(b)).wrapping_mul(0xA076_1D64_78BD_642F);
+    let (p, n) = (s.as_ptr(), s.len());
+    let mut h: u64 = 0x243F_6A88_85A3_08D3 ^ n as u64;
+    let mut i = 0;
+    while i < n {
+        let w = unsafe { (p.add(i) as *const u64).read_unaligned() };
+        let w = if n - i < 8 { unsafe { std::arch::x86_64::_bzhi_u64(w, 8 * (n - i) as u32) } } else { w };
+        h = (h.rotate_left(23) ^ w).wrapping_mul(0xA076_1D64_78BD_642F);
+        i += 8;
     }
     (h ^ (h >> 31)).wrapping_mul(0xE703_7ED1_A0B4_28DB) >> 48
+}
+
+/// `hash_bytes` reading whole words (the 8 bytes after `s` must be readable).
+#[inline(always)]
+pub fn hash_padded(s: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let (p, n) = (s.as_ptr(), s.len());
+    let mut h = (n as u64).wrapping_mul(K);
+    let mut i = 0;
+    while i + 8 <= n {
+        let w = unsafe { (p.add(i) as *const u64).read_unaligned() };
+        h = (h ^ w).wrapping_mul(K);
+        h ^= h >> 29;
+        i += 8;
+    }
+    if i < n {
+        let w = unsafe { std::arch::x86_64::_bzhi_u64((p.add(i) as *const u64).read_unaligned(), 8 * (n - i) as u32) };
+        h = (h ^ w).wrapping_mul(K);
+        h ^= h >> 29;
+    }
+    h.wrapping_mul(0xD6E8_FEB8_6659_7F4B) ^ (h >> 32)
 }
 
 /// A name word: check hash (16 bits) << 48 | length (8) << 40 | source offset (40).
@@ -85,7 +110,7 @@ pub fn source_bytes(off: u64, len: usize) -> &'static [u8] {
 /// The fingerprint key of an ID that does not pack.
 #[inline(always)]
 pub fn fp_key(s: &[u8]) -> u64 {
-    INTERN_BIT | FP_BIT | (hash_bytes(s) & FP_MASK & FP_TEST_MASK.load(AtomicOrdering::Relaxed)) | 1
+    INTERN_BIT | FP_BIT | (hash_padded(s) & FP_MASK & FP_TEST_MASK.load(AtomicOrdering::Relaxed)) | 1
 }
 
 /// Test hook (FP_TEST_BITS): narrows fingerprints so that collisions happen.

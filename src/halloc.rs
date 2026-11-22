@@ -39,7 +39,7 @@ const MADV_POPULATE_WRITE: i32 = 23;
 const MREMAP_MAYMOVE: i32 = 1;
 
 const HUGE: usize = 2 << 20;
-/// Threshold for mapped blocks: HBIG (MB, 0 = never), 4 MB by default. Read
+/// Threshold for mapped blocks: HBIG (MB, 0 = never), off by default. Read
 /// once, before the first large allocation, so every block keeps its kind.
 static BIG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -52,7 +52,9 @@ fn big() -> usize {
     let v = match env_bytes(b"HBIG\0") {
         Some(b"0") => usize::MAX,
         Some(t) => std::str::from_utf8(t).ok().and_then(|t| t.parse::<usize>().ok()).map_or(4 << 20, |m| m << 20),
-        None => 4 << 20,
+        // Off unless asked for: on the scorer it was no faster (0.765 s vs 0.767 s
+        // in-process at 20M without prefault, 0.795 s with it).
+        None => usize::MAX,
     };
     BIG.store(v, Ordering::Relaxed);
     v

@@ -448,7 +448,7 @@ unsafe fn convert_event(ctx: &Ctx, p: *const u8, origin: isize, fbase: usize, s:
             // A long id: a fingerprint for dedup's tables, and where its bytes are.
             let bytes = std::slice::from_raw_parts(at(0), ln(0));
             let src = (fbase as isize + origin + (at(0) as isize - p as isize)) as u64;
-            (keys::INTERN_BIT | ((keys::hash_bytes(bytes) & 0x7FFF_FFFF) << 32) | (src >> 8), src)
+            (keys::INTERN_BIT | ((keys::hash_padded(bytes) & 0x7FFF_FFFF) << 32) | (src >> 8), src)
         }
     };
     // ingest must fit 24 signed bits (the fast pipeline gives up otherwise).
