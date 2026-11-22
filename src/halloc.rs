@@ -12,6 +12,22 @@ extern "C" {
     fn munmap(addr: *mut u8, len: usize) -> i32;
     fn mremap(old: *mut u8, old_len: usize, new_len: usize, flags: i32, ...) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn getenv(name: *const u8) -> *const u8;
+}
+
+/// An environment variable's bytes, read without allocating (this runs inside the allocator).
+fn env_bytes(name: &'static [u8]) -> Option<&'static [u8]> {
+    unsafe {
+        let p = getenv(name.as_ptr());
+        if p.is_null() {
+            return None;
+        }
+        let mut n = 0;
+        while *p.add(n) != 0 {
+            n += 1;
+        }
+        Some(std::slice::from_raw_parts(p, n))
+    }
 }
 
 const PROT_READ_WRITE: i32 = 0x1 | 0x2;
@@ -33,9 +49,9 @@ fn big() -> usize {
     if b != 0 {
         return b;
     }
-    let v = match std::env::var_os("HBIG") {
-        Some(v) if v == "0" => usize::MAX,
-        Some(v) => v.to_str().and_then(|t| t.parse::<usize>().ok()).map_or(4 << 20, |m| m << 20),
+    let v = match env_bytes(b"HBIG\0") {
+        Some(b"0") => usize::MAX,
+        Some(t) => std::str::from_utf8(t).ok().and_then(|t| t.parse::<usize>().ok()).map_or(4 << 20, |m| m << 20),
         None => 4 << 20,
     };
     BIG.store(v, Ordering::Relaxed);
@@ -50,8 +66,7 @@ fn populate() -> bool {
         1 => true,
         2 => false,
         _ => {
-            // Reading the variable allocates only small blocks (mimalloc), never re-entering here.
-            let on = std::env::var_os("HPOP").map_or(true, |v| v != "0");
+            let on = env_bytes(b"HPOP\0") != Some(b"0");
             POPULATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
