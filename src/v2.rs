@@ -1315,7 +1315,9 @@ pub fn run() -> bool {
     // table has about 3x that room; an input with far more long user IDs still works
     // through the table's locked overflow path.
     let total_bytes: usize = event_maps.iter().chain(&click_maps).chain(&link_maps).flatten().map(|m| m.len()).sum();
-    keys::init_interner(total_bytes / 8000 + (1 << 14), total_bytes);
+    // The arena is a virtual reservation; ARENA_DIV shrinks it (experiment).
+    let arena_div: usize = env("ARENA_DIV", "1").parse().unwrap();
+    keys::init_interner(total_bytes / 8000 + (1 << 14), (total_bytes / arena_div).max(64 << 20));
     // One offset space over the event and click files, for keys that point into them.
     let (mut src_files, mut ev_base, mut ck_base) = (Vec::new(), vec![0usize; event_maps.len()], vec![0usize; click_maps.len()]);
     for (maps, bases) in [(&event_maps, &mut ev_base), (&click_maps, &mut ck_base)] {
