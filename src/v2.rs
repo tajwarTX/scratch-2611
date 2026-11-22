@@ -1419,7 +1419,7 @@ pub fn run() -> bool {
 
     let est_events = event_bytes / 80 + 1;
     let tbits = (usize::BITS - (threads.max(2) - 1).leading_zeros()).max(1);
-    let per_part: usize = env("PER_PART", "49152").parse().unwrap();
+    let per_part: usize = env("PER_PART", "98304").parse().unwrap();
     crate::scatter2::NT.store(env("SCATTER_NT", "1") == "1", Ordering::Relaxed);
     crate::scatter2::DIRECT.store(env("SCAT", "") == "direct", Ordering::Relaxed);
     let per_part1: usize = env("PER_PART1", &per_part.to_string()).parse().unwrap();
