@@ -75,9 +75,36 @@ struct PEv {
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Dd {
+    /// A packed event_id; or, for a long one, INTERN_BIT | fingerprint(31) << 32
+    /// | source offset >> 8 (the low 8 bits of the offset are in `word`).
     id: u64,
-    ingest: i32,
+    /// ingest (24 bits, signed) | low 8 bits of the source offset << 24.
+    word: u32,
     loc: u32,
+}
+
+/// The dedup key of a record: the whole packed id, or the fingerprint part of a long one.
+#[inline(always)]
+fn dkey(id: u64) -> u64 {
+    if id & keys::INTERN_BIT != 0 { id & 0xFFFF_FFFF_0000_0000 } else { id }
+}
+#[inline(always)]
+fn dsrc(id: u64, word: u32) -> u64 {
+    ((id & 0xFFFF_FFFF) << 8) | (word >> 24) as u64
+}
+#[inline(always)]
+fn dingest(word: u32) -> i32 {
+    ((word << 8) as i32) >> 8
+}
+#[inline(always)]
+fn dword(ingest: i32, src: u64) -> u32 {
+    ((src & 0xFF) as u32) << 24 | (ingest as u32 & 0x00FF_FFFF)
+}
+/// Whether two long event ids (same fingerprint) are the same string.
+#[inline(never)]
+fn same_long_id(a: u64, aw: u32, b: u64, bw: u32) -> bool {
+    let (sa, sb) = (dsrc(a, aw), dsrc(b, bw));
+    sa == sb || keys::source_slice(sa) == keys::source_slice(sb)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -382,6 +409,8 @@ unsafe fn ingest_at(ctx: &Ctx, p: *const u8, n: usize) -> Option<i32> {
 /// the copy is valid.
 struct EvOut {
     id: u64,
+    /// The source offset of a long id (0 for a packed one).
+    src: u64,
     ingest: Option<i32>,
     ev: Option<PEv>,
 }
@@ -389,15 +418,24 @@ struct EvOut {
 /// Converts one well-formed event line (field ranges `s`/`e` from `p`, PAD
 /// readable around each field). None: empty event_id, the line is dropped.
 #[inline(always)]
-unsafe fn convert_event(ctx: &Ctx, p: *const u8, s: &[u32; 7], e: &[u32; 7]) -> Option<EvOut> {
+unsafe fn convert_event(ctx: &Ctx, p: *const u8, origin: isize, fbase: usize, s: &[u32; 7], e: &[u32; 7]) -> Option<EvOut> {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
     let at = |i: usize| p.add(s[i] as usize);
     let ln = |i: usize| (e[i] - s[i]) as usize;
     if ln(0) == 0 {
         return None;
     }
-    let id = key_at(at(0), ln(0));
-    let ingest = ingest_at(ctx, at(3), ln(3));
+    let (id, src) = match fast::pack9(at(0), ln(0)) {
+        Some(k) => (k, 0u64),
+        None => {
+            // A long id: a fingerprint for dedup's tables, and where its bytes are.
+            let bytes = std::slice::from_raw_parts(at(0), ln(0));
+            let src = (fbase as isize + origin + (at(0) as isize - p as isize)) as u64;
+            (keys::INTERN_BIT | ((keys::hash_bytes(bytes) & 0x7FFF_FFFF) << 32) | (src >> 8), src)
+        }
+    };
+    // ingest must fit 24 signed bits (the fast pipeline gives up otherwise).
+    let ingest = ingest_at(ctx, at(3), ln(3)).filter(|v| (-(1 << 23)..(1 << 23)).contains(v));
     let ingest_ms = ws + ingest.unwrap_or(0) as i64 * 1000;
     let ev = 'valid: {
         if ln(1) == 0 || ln(5) == 0 {
@@ -428,18 +466,18 @@ unsafe fn convert_event(ctx: &Ctx, p: *const u8, s: &[u32; 7], e: &[u32; 7]) -> 
         }
         Some(PEv { person: key_at(at(1), ln(1)), ts: (ts - base) as u32, pc })
     };
-    Some(EvOut { id, ingest, ev })
+    Some(EvOut { id, src, ingest, ev })
 }
 
 #[inline(never)]
-fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState) {
+fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState, fbase: usize) {
     let (p1, p2, ib) = (ctx.p1_bits, ctx.p2_bits, ctx.idx_bits);
     let loc_hi = st.tid << (p2 + ib);
     let idx_max = (1usize << ib) - 2;
     let AState { pe, dd, sc, bad, .. } = st;
-    tok::scan_file_pf::<7>(sc, file, start, end, #[inline(always)]
-    |p, s, e| unsafe {
-        let Some(o) = convert_event(ctx, p, s, e) else { return };
+    tok::scan_file_src::<7>(sc, file, start, end, #[inline(always)]
+    |p, origin, s, e| unsafe {
+        let Some(o) = convert_event(ctx, p, origin, fbase, s, e) else { return };
         let ingest = o.ingest.unwrap_or_else(|| {
             *bad = true;
             0
@@ -453,7 +491,7 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
             }
             loc = loc_hi | ((pp as u32) << ib) | (idx as u32 & ((1 << ib) - 1));
         }
-        dd.push(part(o.id, p1), Dd { id: o.id, ingest, loc });
+        dd.push(part(dkey(o.id), p1), Dd { id: o.id, word: dword(ingest, o.src), loc });
     }, |p, n| keys::prefetch(unsafe { std::slice::from_raw_parts(p, n) }));
 }
 
@@ -499,7 +537,7 @@ fn conv_bench(ctx: &Ctx, maps: &[Option<Mmap>]) {
                 }
                 continue;
             }
-            if let Some(o) = unsafe { convert_event(ctx, base, s, e) } {
+            if let Some(o) = unsafe { convert_event(ctx, base, 0, 0, s, e) } {
                 sink = sink.wrapping_add(o.id ^ o.ingest.unwrap_or(0) as u64);
                 if let Some(ev) = o.ev {
                     sink = sink.wrapping_add(ev.person ^ ev.ts as u64 ^ ev.pc as u64);
@@ -511,11 +549,11 @@ fn conv_bench(ctx: &Ctx, maps: &[Option<Mmap>]) {
 }
 
 #[inline(never)]
-fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState) {
+fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState, fbase: usize) {
     let (lo, hi, base, p2) = (ctx.ws - REACH, ctx.we, ctx.base, ctx.p2_bits);
     let AState { pc, sc, .. } = st;
-    tok::scan_file_pf::<4>(sc, file, start, end, #[inline(always)]
-    |p, s, e| unsafe {
+    tok::scan_file_src::<4>(sc, file, start, end, #[inline(always)]
+    |p, origin, s, e| unsafe {
         let at = |i: usize| p.add(s[i] as usize);
         let ln = |i: usize| (e[i] - s[i]) as usize;
         if ln(0) == 0 || ln(1) == 0 {
@@ -527,7 +565,15 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
         };
         let Some(camp) = ctx.campaign(std::slice::from_raw_parts(at(2), ln(2))) else { return };
         let user = key_at(at(1), ln(1));
-        pc.push(part(user, p2), PCk { person: user, id: key_at(at(0), ln(0)), ts: (ts - base) as u32, camp });
+        // A click id is only ever ordered (ties on ts): a long one points at its bytes.
+        let id = match fast::pack9(at(0), ln(0)) {
+            Some(k) => k,
+            None => {
+                keys::note_nonpacked();
+                keys::INTERN_BIT | keys::SRC_BIT | (fbase as isize + origin + (at(0) as isize - p as isize)) as u64
+            }
+        };
+        pc.push(part(user, p2), PCk { person: user, id, ts: (ts - base) as u32, camp });
     }, |p, n| keys::prefetch(unsafe { std::slice::from_raw_parts(p, n) }));
 }
 
@@ -536,9 +582,9 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
 struct BState {
     bits: Vec<u64>,
     cand: Vec<Dd>,
-    /// Exact table over the candidates: id (0: empty) and its best (ingest, loc).
+    /// Exact table over the candidates: dedup key (0: empty) and the best copy so far.
     keys: Vec<u64>,
-    best: Vec<(i32, u32)>,
+    best: Vec<Dd>,
 }
 
 /// Raw base pointers of every (thread, person partition) event buffer.
@@ -567,7 +613,7 @@ fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p1: u32, p2: u32, ib: 
     let bits = &mut st.bits[..];
     for s in a {
         for r in s.dd.records(j) {
-            let h = dd_hash(r.id, p1, shift);
+            let h = dd_hash(dkey(r.id), p1, shift);
             let w = unsafe { bits.get_unchecked_mut(h >> 5) };
             let b = (h & 31) * 2;
             let seen = (*w >> b) & 1;
@@ -582,7 +628,7 @@ fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p1: u32, p2: u32, ib: 
     let mut nc = 0usize;
     for s in a {
         for r in s.dd.records(j) {
-            let h = dd_hash(r.id, p1, shift);
+            let h = dd_hash(dkey(r.id), p1, shift);
             let dup = unsafe { (*bits.get_unchecked(h >> 5) >> ((h & 31) * 2 + 1)) & 1 };
             unsafe { cand.add(nc).write(*r) };
             nc += dup as usize;
@@ -598,7 +644,7 @@ fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p1: u32, p2: u32, ib: 
     st.keys.clear();
     st.keys.resize(cap, 0);
     if st.best.len() < cap {
-        st.best.resize(cap, (0, 0));
+        st.best.resize(cap, Dd::default());
     }
     let tomb = |loc: u32| {
         if loc != NONE {
@@ -610,24 +656,26 @@ fn dedup_partition(a: &[AState], j: usize, bases: &Bases, p1: u32, p2: u32, ib: 
     };
     let (keys, best) = (&mut st.keys[..], &mut st.best[..]);
     for r in &st.cand {
-        // Keys are never 0 (packed IDs are non-empty, interned ones have the top bit).
+        // Keys are never 0 (packed IDs are non-empty, long ones have the top bit).
         // mix's low bits: unrelated to both the partition and the filter slot.
-        let mut i = mix(r.id) as usize & (cap - 1);
+        let dk = dkey(r.id);
+        let long = dk & keys::INTERN_BIT != 0;
+        let mut i = mix(dk) as usize & (cap - 1);
         loop {
             let k = keys[i];
-            if k == r.id {
+            if k == dk && (!long || same_long_id(r.id, r.word, best[i].id, best[i].word)) {
                 let b = &mut best[i];
-                if r.ingest < b.0 {
-                    tomb(b.1);
-                    *b = (r.ingest, r.loc);
+                if dingest(r.word) < dingest(b.word) {
+                    tomb(b.loc);
+                    *b = *r;
                 } else {
                     tomb(r.loc);
                 }
                 break;
             }
             if k == 0 {
-                keys[i] = r.id;
-                best[i] = (r.ingest, r.loc);
+                keys[i] = dk;
+                best[i] = *r;
                 break;
             }
             i = (i + 1) & (cap - 1);
@@ -1266,6 +1314,20 @@ pub fn run() -> bool {
     // input where every ID is long still fits the table's locked overflow path.
     let total_bytes: usize = event_maps.iter().chain(&click_maps).chain(&link_maps).flatten().map(|m| m.len()).sum();
     keys::init_interner(total_bytes / 600 + (1 << 14), total_bytes);
+    // One offset space over the event and click files, for keys that point into them.
+    let (mut src_files, mut ev_base, mut ck_base) = (Vec::new(), vec![0usize; event_maps.len()], vec![0usize; click_maps.len()]);
+    for (maps, bases) in [(&event_maps, &mut ev_base), (&click_maps, &mut ck_base)] {
+        for (i, m) in maps.iter().enumerate() {
+            if let Some(m) = m {
+                bases[i] = src_files.len();
+                src_files.push((m.as_ptr(), m.len()));
+            }
+        }
+    }
+    let src_bases = keys::set_source(&src_files);
+    for b in ev_base.iter_mut().chain(ck_base.iter_mut()) {
+        *b = src_bases[*b];
+    }
     let event_bytes: usize = event_maps.iter().flatten().map(|m| m.len()).sum();
     let link_bytes: usize = link_maps.iter().flatten().map(|m| m.len()).sum();
 
@@ -1369,8 +1431,8 @@ pub fn run() -> bool {
         let (kind, fi, s, e) = jobs[j];
         let mut run = |st: &mut AState, data: &[u8], s: usize, e: usize| match kind {
             0 => parse_links(data, s, e, &links, &mut st.sc),
-            1 => parse_events(data, s, e, &ctx, st),
-            _ => parse_clicks(data, s, e, &ctx, st),
+            1 => parse_events(data, s, e, &ctx, st, ev_base[fi]),
+            _ => parse_clicks(data, s, e, &ctx, st, ck_base[fi]),
         };
         if !readio {
             run(st, maps[kind as usize][fi].as_ref().unwrap(), s, e);

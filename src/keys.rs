@@ -15,6 +15,11 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering 
 use std::sync::Mutex;
 
 pub const INTERN_BIT: u64 = 1 << 63;
+/// With INTERN_BIT: the key's low 40 bits are an offset into the input (see
+/// `set_source`), and the string runs to the next `,`, `"` or newline.
+pub const SRC_BIT: u64 = 1 << 62;
+/// With INTERN_BIT: a string on the heap (only when the arena was too small).
+const HEAP_BIT: u64 = 1 << 61;
 const MAX_PACKED: usize = 9;
 
 #[inline(always)]
@@ -113,8 +118,53 @@ fn init_default() {
     });
 }
 
+/// The input files, for keys that point into them.
+struct SourceTab {
+    bases: Vec<usize>,
+    files: Vec<(*const u8, usize)>,
+}
+unsafe impl Sync for SourceTab {}
+unsafe impl Send for SourceTab {}
+static SOURCE: AtomicPtr<SourceTab> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Registers the input files (they must stay mapped for the run) and returns
+/// each file's base in one shared offset space: a key with SRC_BIT holds
+/// `base + offset in the file`.
+pub fn set_source(files: &[(*const u8, usize)]) -> Vec<usize> {
+    let mut bases = Vec::with_capacity(files.len());
+    let mut b = 0usize;
+    for &(_, len) in files {
+        bases.push(b);
+        b += len;
+    }
+    assert!(b < (1usize << 40));
+    let tab = Box::new(SourceTab { bases: bases.clone(), files: files.to_vec() });
+    SOURCE.store(Box::into_raw(tab), AtomicOrdering::Release);
+    bases
+}
+
+/// The field value starting at source offset `off`: it ends at the next `,`,
+/// `"` or newline (a value never holds one), or at the file's end.
+#[inline]
+pub fn source_slice(off: u64) -> &'static [u8] {
+    let tab = unsafe { &*SOURCE.load(AtomicOrdering::Acquire) };
+    let off = off as usize;
+    let i = tab.bases.partition_point(|&b| b <= off) - 1;
+    let (p, len) = tab.files[i];
+    let at = off - tab.bases[i];
+    let rest = unsafe { std::slice::from_raw_parts(p.add(at), len - at) };
+    let n = memchr::memchr3(b',', b'"', b'\n', rest).unwrap_or(rest.len());
+    &rest[..n]
+}
+
+/// Records that some key is not a packed one (so integer order is not byte order).
 #[inline(always)]
-fn hash_bytes(s: &[u8]) -> u64 {
+pub fn note_nonpacked() {
+    ANY_INTERNED.store(true, AtomicOrdering::Relaxed);
+}
+
+#[inline(always)]
+pub fn hash_bytes(s: &[u8]) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut h = (s.len() as u64).wrapping_mul(K);
     let mut p = s;
@@ -246,7 +296,7 @@ impl Interner {
                 // No room in the arena at all (not reachable with an arena sized
                 // to the input); keep exactness by storing the string on the heap
                 // behind a key above every arena offset.
-                let k = INTERN_BIT | (1u64 << 62) | extra.len() as u64;
+                let k = INTERN_BIT | HEAP_BIT | extra.len() as u64;
                 extra.insert(s.to_vec(), k);
                 HEAP.lock().unwrap().push(s.to_vec());
                 return k;
@@ -259,7 +309,10 @@ impl Interner {
 
     #[inline(always)]
     fn bytes_of(&self, k: u64) -> &[u8] {
-        if k & (1 << 62) != 0 {
+        if k & SRC_BIT != 0 {
+            return source_slice(k & OFF_MASK);
+        }
+        if k & HEAP_BIT != 0 {
             // Heap strings: rare, and only when the arena was too small.
             let v = HEAP.lock().unwrap();
             let s = &v[(k & OFF_MASK) as usize];

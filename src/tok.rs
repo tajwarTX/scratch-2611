@@ -385,6 +385,20 @@ pub fn scan_file_pf<const N: usize>(
     s: usize,
     e: usize,
     mut each: impl FnMut(*const u8, &[u32; N], &[u32; N]),
+    ahead: impl FnMut(*const u8, usize),
+) {
+    scan_file_src::<N>(sc, file, s, e, |p, _, a, b| each(p, a, b), ahead)
+}
+
+/// `scan_file_pf` whose `each` also gets the piece's origin: a byte at `ptr`
+/// of the piece sits at `origin + (ptr - p)` in the file.
+#[inline(always)]
+pub fn scan_file_src<const N: usize>(
+    sc: &mut Scanner,
+    file: &[u8],
+    s: usize,
+    e: usize,
+    mut each: impl FnMut(*const u8, isize, &[u32; N], &[u32; N]),
     mut ahead: impl FnMut(*const u8, usize),
 ) {
     let len = file.len();
@@ -403,7 +417,7 @@ pub fn scan_file_pf<const N: usize>(
     }
     if s.max(PAD) == s && mid > s {
         let p = file.as_ptr();
-        unsafe { sc.scan::<N>(p, s, mid, #[inline(always)] |a, b| each(p, a, b), &mut ahead) };
+        unsafe { sc.scan::<N>(p, s, mid, #[inline(always)] |a, b| each(p, 0, a, b), &mut ahead) };
     } else {
         mid = s;
     }
@@ -417,7 +431,8 @@ pub fn scan_file_pf<const N: usize>(
             end += 1;
         }
         let p = buf.as_ptr();
-        unsafe { sc.scan::<N>(p, PAD, end, |a, b| each(p, a, b), &mut ahead) };
+        let origin = mid as isize - PAD as isize;
+        unsafe { sc.scan::<N>(p, PAD, end, |a, b| each(p, origin, a, b), &mut ahead) };
     }
 }
 
