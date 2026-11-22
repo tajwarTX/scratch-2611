@@ -1,18 +1,14 @@
 [package]
-name = "pipeline"
+name = "shopping-sessions"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [[bin]]
-name = "pipeline"
+name = "sessions"
 path = "src/main.rs"
 
 [dependencies]
-memchr = "2"
-memmap2 = "0.9"
-bytes = "1"
-mimalloc = { version = "0.1", default-features = false }
-parquet = { version = "55", default-features = false }
 
 [profile.release]
 opt-level = 3

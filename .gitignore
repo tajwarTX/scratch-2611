@@ -1,7 +1,4 @@
-/kit/
-/target/
-/out/
-/dev/
-/data/
+target/
+out/
+dev/
 *.parquet
-.DS_Store
