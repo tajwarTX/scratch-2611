@@ -2,6 +2,7 @@
 //! `legacy` is the general one it falls back to when a dataset breaks one of
 //! v2's compact-record assumptions.
 
+mod halloc;
 mod bench;
 mod csv;
 mod fast;
@@ -17,7 +18,7 @@ mod ts;
 mod v2;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: halloc::HugeAlloc = halloc::HugeAlloc;
 
 fn main() {
     if std::env::var("BENCH").is_ok() {
