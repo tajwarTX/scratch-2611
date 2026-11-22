@@ -1310,10 +1310,12 @@ pub fn run() -> bool {
     let event_maps: Vec<Option<Mmap>> = list_csv(&data.join("events")).iter().map(|p| map_file(p)).collect();
     let click_maps: Vec<Option<Mmap>> = list_csv(&data.join("clicks")).iter().map(|p| map_file(p)).collect();
     let link_maps: Vec<Option<Mmap>> = list_csv(&data.join("links")).iter().map(|p| map_file(p)).collect();
-    // Long IDs are interned: about one line in eight has one (v5 data), and an
-    // input where every ID is long still fits the table's locked overflow path.
+    // Only long user IDs are interned (event and click IDs point into the
+    // input instead): about one user ID in eight, of ~1 per 30 events. The
+    // table has 4x that room; an input with far more long user IDs still works
+    // through the table's locked overflow path.
     let total_bytes: usize = event_maps.iter().chain(&click_maps).chain(&link_maps).flatten().map(|m| m.len()).sum();
-    keys::init_interner(total_bytes / 600 + (1 << 14), total_bytes);
+    keys::init_interner(total_bytes / 1200 + (1 << 14), total_bytes);
     // One offset space over the event and click files, for keys that point into them.
     let (mut src_files, mut ev_base, mut ck_base) = (Vec::new(), vec![0usize; event_maps.len()], vec![0usize; click_maps.len()]);
     for (maps, bases) in [(&event_maps, &mut ev_base), (&click_maps, &mut ck_base)] {
@@ -1500,6 +1502,10 @@ pub fn run() -> bool {
         return false;
     }
     log!(t0, "parse");
+    if env("ISTAT", "0") == "1" {
+        let (n, cap, extra) = keys::interner_stats();
+        eprintln!("interner: {} of {} slots, {} in the locked overflow", n, cap, extra);
+    }
 
     // B: dedup.
     let bases = Bases(a_states.iter_mut().map(|s| (0..p2).map(|pp| s.pe.base_ptr(pp)).collect()).collect());

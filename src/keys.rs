@@ -341,6 +341,12 @@ pub fn intern(s: &[u8]) -> u64 {
     interner().intern(s)
 }
 
+/// (table entries, table slots, strings in the locked overflow map), for diagnostics.
+pub fn interner_stats() -> (usize, usize, usize) {
+    let it = interner();
+    (it.slots.iter().filter(|x| x.load(AtomicOrdering::Relaxed) != 0).count(), it.slots.len(), it.extra.lock().unwrap().len())
+}
+
 /// The number of interned strings so far (for diagnostics).
 pub fn interned_count() -> usize {
     let it = interner();
