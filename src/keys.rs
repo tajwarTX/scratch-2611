@@ -272,6 +272,16 @@ impl Interner {
 
 static HEAP: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// Starts loading the table slot `s` hashes to, ahead of `intern(s)`.
+#[inline(always)]
+pub fn prefetch(s: &[u8]) {
+    let it = interner();
+    let i = hash_bytes(s) as usize & it.mask;
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(it.slots.as_ptr().add(i) as *const i8);
+    }
+}
+
 #[cold]
 pub fn intern(s: &[u8]) -> u64 {
     ANY_INTERNED.store(true, AtomicOrdering::Relaxed);

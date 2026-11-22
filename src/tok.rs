@@ -236,9 +236,17 @@ impl Scanner {
 
     /// Same contract as `Scanner3::scan`, for N <= 8.
     #[inline(always)]
-    pub unsafe fn scan<const N: usize>(&mut self, data: *const u8, s: usize, e: usize, mut each: impl FnMut(&[u32; N], &[u32; N])) {
+    pub unsafe fn scan<const N: usize>(
+        &mut self,
+        data: *const u8,
+        s: usize,
+        e: usize,
+        mut each: impl FnMut(&[u32; N], &[u32; N]),
+        mut ahead: impl FnMut(*const u8, usize),
+    ) {
         debug_assert!(N >= 1 && N <= 8);
         let idx = self.idx.as_mut_ptr();
+        let pf = PREFETCH.load(std::sync::atomic::Ordering::Relaxed);
         let flg = self.flg.as_mut_ptr();
         const B01: u64 = 0x0101_0101_0101_0101;
         let batch = BATCH_RT.load(std::sync::atomic::Ordering::Relaxed);
@@ -318,6 +326,24 @@ impl Scanner {
                     if N == 1 && *idx.add(k) == (*idx.add(k - 1)).wrapping_add(1) {
                         continue; // an empty line
                     }
+                    // Long values of the first two fields of the line 8 lines on
+                    // (if the lines between are regular): `ahead` may start a
+                    // load for them. Only a hint, so no check that the line is
+                    // well formed.
+                    if pf {
+                        let j = k + 7 * N;
+                        if j + 2 <= total {
+                            for f in 0..N.min(2) {
+                                let q = ((*flg.add(j + f) >> 1) & 1) as u32;
+                                let a = (*idx.add(j + f)).wrapping_add(1 + q);
+                                let b = (*idx.add(j + f + 1)).wrapping_sub(q);
+                                let n = b.wrapping_sub(a);
+                                if n.wrapping_sub(10) < 500 {
+                                    ahead(data.add(a as usize), n as usize);
+                                }
+                            }
+                        }
+                    }
                     each(&*(st.as_ptr() as *const [u32; N]), &*(en.as_ptr() as *const [u32; N]));
                 } else {
                     // Not N fields: skip past the line's newline (or to the batch's end).
@@ -343,7 +369,24 @@ impl Scanner {
 /// end directly, the rest from a padded copy (with a `\n` added when the
 /// file does not end with one). `each` gets the line's base pointer.
 #[inline(always)]
-pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usize, mut each: impl FnMut(*const u8, &[u32; N], &[u32; N])) {
+pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usize, each: impl FnMut(*const u8, &[u32; N], &[u32; N])) {
+    scan_file_pf::<N>(sc, file, s, e, each, |_, _| {})
+}
+
+/// Experiment switch for the lookahead (PF=0 turns it off).
+pub static PREFETCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `scan_file` with `ahead(ptr, len)` called for long values (10 bytes or
+/// more) of the first two fields of lines about 8 ahead of the current one.
+#[inline(always)]
+pub fn scan_file_pf<const N: usize>(
+    sc: &mut Scanner,
+    file: &[u8],
+    s: usize,
+    e: usize,
+    mut each: impl FnMut(*const u8, &[u32; N], &[u32; N]),
+    mut ahead: impl FnMut(*const u8, usize),
+) {
     let len = file.len();
     let safe = len.saturating_sub(PAD + 64);
     let mut mid = e;
@@ -360,7 +403,7 @@ pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usi
     }
     if s.max(PAD) == s && mid > s {
         let p = file.as_ptr();
-        unsafe { sc.scan::<N>(p, s, mid, #[inline(always)] |a, b| each(p, a, b)) };
+        unsafe { sc.scan::<N>(p, s, mid, #[inline(always)] |a, b| each(p, a, b), &mut ahead) };
     } else {
         mid = s;
     }
@@ -374,7 +417,7 @@ pub fn scan_file<const N: usize>(sc: &mut Scanner, file: &[u8], s: usize, e: usi
             end += 1;
         }
         let p = buf.as_ptr();
-        unsafe { sc.scan::<N>(p, PAD, end, |a, b| each(p, a, b)) };
+        unsafe { sc.scan::<N>(p, PAD, end, |a, b| each(p, a, b), &mut ahead) };
     }
 }
 

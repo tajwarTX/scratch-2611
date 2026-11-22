@@ -289,7 +289,7 @@ impl Links {
 }
 
 fn parse_links(file: &[u8], start: usize, end: usize, links: &Links, sc: &mut Scanner) {
-    tok::scan_file::<2>(sc, file, start, end, #[inline(always)]
+    tok::scan_file_pf::<2>(sc, file, start, end, #[inline(always)]
     |p, s, e| unsafe {
         let (na, nb) = ((e[0] - s[0]) as usize, (e[1] - s[1]) as usize);
         if na == 0 || nb == 0 {
@@ -300,7 +300,7 @@ fn parse_links(file: &[u8], start: usize, end: usize, links: &Links, sc: &mut Sc
             let (a, b) = (links.insert(ka), links.insert(kb));
             links.union(a, b);
         }
-    });
+    }, |p, n| keys::prefetch(unsafe { std::slice::from_raw_parts(p, n) }));
 }
 
 // ---------------------------------------------------------------- parse
@@ -437,7 +437,7 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
     let loc_hi = st.tid << (p2 + ib);
     let idx_max = (1usize << ib) - 2;
     let AState { pe, dd, sc, bad, .. } = st;
-    tok::scan_file::<7>(sc, file, start, end, #[inline(always)]
+    tok::scan_file_pf::<7>(sc, file, start, end, #[inline(always)]
     |p, s, e| unsafe {
         let Some(o) = convert_event(ctx, p, s, e) else { return };
         let ingest = o.ingest.unwrap_or_else(|| {
@@ -454,7 +454,7 @@ fn parse_events(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
             loc = loc_hi | ((pp as u32) << ib) | (idx as u32 & ((1 << ib) - 1));
         }
         dd.push(part(o.id, p1), Dd { id: o.id, ingest, loc });
-    });
+    }, |p, n| keys::prefetch(unsafe { std::slice::from_raw_parts(p, n) }));
 }
 
 /// CBENCH=1: single-thread cost of `convert_event` alone, over the largest
@@ -514,7 +514,7 @@ fn conv_bench(ctx: &Ctx, maps: &[Option<Mmap>]) {
 fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AState) {
     let (lo, hi, base, p2) = (ctx.ws - REACH, ctx.we, ctx.base, ctx.p2_bits);
     let AState { pc, sc, .. } = st;
-    tok::scan_file::<4>(sc, file, start, end, #[inline(always)]
+    tok::scan_file_pf::<4>(sc, file, start, end, #[inline(always)]
     |p, s, e| unsafe {
         let at = |i: usize| p.add(s[i] as usize);
         let ln = |i: usize| (e[i] - s[i]) as usize;
@@ -528,7 +528,7 @@ fn parse_clicks(file: &[u8], start: usize, end: usize, ctx: &Ctx, st: &mut AStat
         let Some(camp) = ctx.campaign(std::slice::from_raw_parts(at(2), ln(2))) else { return };
         let user = key_at(at(1), ln(1));
         pc.push(part(user, p2), PCk { person: user, id: key_at(at(0), ln(0)), ts: (ts - base) as u32, camp });
-    });
+    }, |p, n| keys::prefetch(unsafe { std::slice::from_raw_parts(p, n) }));
 }
 
 // ---------------------------------------------------------------- dedup
@@ -1196,6 +1196,7 @@ fn bits_for(items: usize, per_part: usize, max_bits: u32) -> u32 {
 /// (nothing has been written then).
 pub fn run() -> bool {
     let t0 = Instant::now();
+    crate::tok::PREFETCH.store(env("PF", "1") == "1", Ordering::Relaxed);
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let out_dir = PathBuf::from(env("OUTPUT_DIR", "/output"));
     let threads: usize = std::env::var("NCPU")
