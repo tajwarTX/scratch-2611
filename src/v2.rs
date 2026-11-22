@@ -1312,10 +1312,10 @@ pub fn run() -> bool {
     let link_maps: Vec<Option<Mmap>> = list_csv(&data.join("links")).iter().map(|p| map_file(p)).collect();
     // Only long user IDs are interned (event and click IDs point into the
     // input instead): about one user ID in eight, of ~1 per 30 events. The
-    // table has 4x that room; an input with far more long user IDs still works
+    // table has about 3x that room; an input with far more long user IDs still works
     // through the table's locked overflow path.
     let total_bytes: usize = event_maps.iter().chain(&click_maps).chain(&link_maps).flatten().map(|m| m.len()).sum();
-    keys::init_interner(total_bytes / 1200 + (1 << 14), total_bytes);
+    keys::init_interner(total_bytes / 8000 + (1 << 14), total_bytes);
     // One offset space over the event and click files, for keys that point into them.
     let (mut src_files, mut ev_base, mut ck_base) = (Vec::new(), vec![0usize; event_maps.len()], vec![0usize; click_maps.len()]);
     for (maps, bases) in [(&event_maps, &mut ev_base), (&click_maps, &mut ck_base)] {
