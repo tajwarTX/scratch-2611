@@ -1502,6 +1502,12 @@ pub fn run() -> bool {
         return false;
     }
     log!(t0, "parse");
+    {
+        let (n, cap, extra) = keys::interner_stats();
+        let pev = (0..p2).map(|j| a_states.iter().map(|s| s.pe.len(j)).sum::<usize>()).max().unwrap_or(0);
+        let ddm = (0..p1).map(|j| a_states.iter().map(|s| s.dd.len(j)).sum::<usize>()).max().unwrap_or(0);
+        eprintln!("PARTS p1={} p2={} dedup_max_occ={} pev_max_occ={} idx_limit={} interner={}/{} overflow={}", p1, p2, ddm, pev, 1usize << ctx.idx_bits, n, cap, extra);
+    }
     if env("ISTAT", "0") == "1" {
         let (n, cap, extra) = keys::interner_stats();
         eprintln!("interner: {} of {} slots, {} in the locked overflow", n, cap, extra);
